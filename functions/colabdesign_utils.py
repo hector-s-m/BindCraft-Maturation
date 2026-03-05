@@ -455,19 +455,28 @@ def mpnn_gen_sequence_maturation(trajectory_pdb, binder_chain, fixed_positions_s
 def binder_maturation_hallucination(design_name, starting_pdb, chain, target_hotspot_residues, length,
                                      current_sequence, fixed_positions, seed,
                                      helicity_value, design_models, advanced_settings,
-                                     design_paths, failure_csv):
+                                     design_paths, failure_csv, maturation_pdb=None):
     """
     Re-run shortened AF2 hallucination with specific binder positions fixed.
     Starts from an existing sequence and refines non-fixed positions.
 
+    When maturation_pdb is provided and maturation_use_initial_guess is enabled,
+    the scan-optimized structure is fed as an initial guess so AF2 is biased
+    toward preserving the optimized geometry of fixed residues.
+
     Args:
         current_sequence: str, the current best binder sequence
         fixed_positions: list of 0-based binder residue indices to freeze
+        maturation_pdb: optional path to current best complex PDB (scan output)
+                        for use as structural template via initial_guess
     """
     model_pdb_path = os.path.join(design_paths.get("MPNN/Maturation", design_paths["Trajectory"]),
                                    design_name + ".pdb")
 
     clear_mem()
+
+    use_template_bias = (advanced_settings.get("maturation_use_initial_guess", False)
+                         and maturation_pdb is not None)
 
     af_model = mk_afdesign_model(protocol="binder", debug=False, data_dir=advanced_settings["af_params_dir"],
                                   use_multimer=advanced_settings["use_multimer_design"],
@@ -477,10 +486,24 @@ def binder_maturation_hallucination(design_name, starting_pdb, chain, target_hot
     if target_hotspot_residues == "":
         target_hotspot_residues = None
 
-    af_model.prep_inputs(pdb_filename=starting_pdb, chain=chain, binder_len=length,
-                          hotspot=target_hotspot_residues, seed=seed, rm_aa=advanced_settings["omit_AAs"],
-                          rm_target_seq=advanced_settings["rm_template_seq_design"],
-                          rm_target_sc=advanced_settings["rm_template_sc_design"])
+    if use_template_bias:
+        # Use the matured complex PDB as structural template — biases AF2
+        # toward preserving scan-optimized geometry of fixed residues.
+        # Uses AF2's template embedding pathway (use_binder_template=True,
+        # rm_template_ic=False) instead of use_initial_guess which is only
+        # compatible with the prediction workflow, not design.
+        af_model.prep_inputs(pdb_filename=maturation_pdb, chain='A', binder_chain='B',
+                              binder_len=length, hotspot=target_hotspot_residues, seed=seed,
+                              rm_aa=advanced_settings["omit_AAs"],
+                              use_binder_template=True, rm_template_ic=False,
+                              rm_target_seq=advanced_settings["rm_template_seq_design"],
+                              rm_target_sc=advanced_settings["rm_template_sc_design"])
+        print(f"  Maturation hallucination: using template bias from {os.path.basename(maturation_pdb)}")
+    else:
+        af_model.prep_inputs(pdb_filename=starting_pdb, chain=chain, binder_len=length,
+                              hotspot=target_hotspot_residues, seed=seed, rm_aa=advanced_settings["omit_AAs"],
+                              rm_target_seq=advanced_settings["rm_template_seq_design"],
+                              rm_target_sc=advanced_settings["rm_template_sc_design"])
 
     # Set weights, contacts, and loss functions (same as regular hallucination)
     _configure_af_model(af_model, advanced_settings, helicity_value)

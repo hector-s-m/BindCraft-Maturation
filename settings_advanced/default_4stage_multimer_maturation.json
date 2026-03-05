@@ -86,5 +86,6 @@
     "maturation_hard_iterations": 5,
     "maturation_greedy_iterations": 10,
     "maturation_num_seqs": 5,
-    "maturation_sampling_temp": 0.1
+    "maturation_sampling_temp": 0.1,
+    "maturation_use_initial_guess": true
 }
