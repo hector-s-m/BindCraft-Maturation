@@ -4,7 +4,7 @@ A modified version of [BindCraft](https://github.com/martinpacesa/BindCraft) / [
 
 Built on BindCraft v1.52 with FreeBindCraft's **optional PyRosetta bypass** (`--no-pyrosetta`) using fully open-source tools (OpenMM, FreeSASA, sc-rs).
 
-For the original BindCraft pipeline, settings, and filter documentation, see the [original repository](https://github.com/martinpacesa/BindCraft) and [preprint](https://www.biorxiv.org/content/10.1101/2024.09.30.615802).
+For the original BindCraft pipeline, settings, and filter documentation, see the [original repository](https://github.com/martinpacesa/BindCraft) and [paper](www.nature.com/articles/s41586-025-09429-6).
 
 ---
 
