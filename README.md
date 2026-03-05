@@ -25,7 +25,7 @@ Opt-in recursive interface refinement that improves binder affinity after the in
    - Per-residue REU ≤ -5.0
    - Per-residue pLDDT ≥ 0.85
    - Per-residue PAE ≤ 5.0
-   - Secondary structure filter (off by default — loop residues can be fixed if they pass the above)
+   - Secondary structure filter (off by default — loop residues can be fixed if they pass the above). PRO residues are always exempt from the SS filter since proline naturally disrupts regular secondary structure
 2. **Partition** — Residues passing ALL thresholds are marked "high quality" and fixed; the rest are redesignable. The fixed set is **monotonically growing** — once fixed, always fixed
 3. **Saturation scan** — Each fixed residue is tested with all candidate amino acids (GLY/CYS excluded) via a two-pass strategy: (1) fast repack-only screen, (2) expensive minimize on top 3 candidates. Scored by target-only interaction REU. Safeguards include H-bond preservation and post-scan dG sanity gating
 4. **Re-hallucination** — AF2 redesigns unfixed positions (via `af_model.opt["fix_pos"]`) while frozen positions retain their identity

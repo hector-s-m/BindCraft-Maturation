@@ -492,11 +492,14 @@ def assess_interface_residue_quality(pdb_file, pae_matrix, plddt_array,
     - REU <= reu_threshold (when PyRosetta available)
     - pLDDT >= plddt_threshold
     - mean interface PAE <= pae_threshold
-    - Defined secondary structure (helix or sheet, not loop/coil)
+    - Defined secondary structure (helix or sheet, not loop/coil) — off by default
+
+    PRO residues are exempt from the SS filter when enabled, since proline
+    naturally disrupts regular secondary structure and often adopts loop/turn
+    conformations.
 
     Using AND logic ensures every fixed residue is genuinely good on all
-    metrics. Loop residues are excluded because their backbone flexibility
-    makes them poor candidates for positional fixing.
+    metrics.
 
     Args:
         pdb_file: Path to the complex PDB
@@ -640,7 +643,13 @@ def assess_interface_residue_quality(pdb_file, pae_matrix, plddt_array,
         # --- Secondary structure ---
         ss_code = residue_ss.get(binder_res_id, 'X')
         # H, G, I = helix types; E = beta sheet; everything else = loop/coil
-        pass_ss = ss_code in ('H', 'G', 'I', 'E') if require_ss else True
+        # PRO is exempt from SS requirement — proline naturally disrupts helices
+        # and often adopts loop/turn conformations
+        res_aa = residue_aa.get(binder_res_id, 'X')
+        if not require_ss or res_aa == 'P':
+            pass_ss = True
+        else:
+            pass_ss = ss_code in ('H', 'G', 'I', 'E')
 
         # High quality = passes ALL applicable filters (AND logic)
         if has_reu:
@@ -665,9 +674,10 @@ def assess_interface_residue_quality(pdb_file, pae_matrix, plddt_array,
 
     n_hq = sum(1 for v in quality_results.values() if v['is_high_quality'])
     n_ss_fail = sum(1 for v in quality_results.values() if not v['pass_ss'])
+    n_pro = sum(1 for v in quality_results.values() if v['aa'] == 'P')
+    ss_note = f", SS=helix/sheet [PRO exempt, {n_ss_fail} rejected for loop/coil SS]" if require_ss else ""
     vprint(f"[Maturation] {n_hq}/{len(quality_results)} interface residues pass all filters "
-           f"(REU<={reu_thresh}, pLDDT>={plddt_thresh}, PAE<={pae_thresh}, SS=helix/sheet) "
-           f"[{n_ss_fail} rejected for loop/coil SS]")
+           f"(REU<={reu_thresh}, pLDDT>={plddt_thresh}, PAE<={pae_thresh}{ss_note})")
 
     return quality_results
 
