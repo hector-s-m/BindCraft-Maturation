@@ -275,7 +275,6 @@ BindCraft-Maturation/
   settings_filters/             # Design filter profiles
   settings_advanced/            # Advanced pipeline settings (incl. maturation configs)
   extras/                       # Analysis and utility scripts (see extras/README.md)
-  technical_overview/           # In-depth technical documentation
 ```
 
 ---

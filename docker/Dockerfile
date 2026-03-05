@@ -1,10 +1,10 @@
 # Build from the project root:
-#   docker build -f docker/Dockerfile -t freebindcraft:gpu .
-#   docker build -f docker/Dockerfile --build-arg WITH_PYROSETTA=true -t freebindcraft:pyrosetta .
+#   docker build -f docker/Dockerfile -t bindcraft-maturation:gpu .
+#   docker build -f docker/Dockerfile --build-arg WITH_PYROSETTA=true -t bindcraft-maturation:pyrosetta .
 FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
-LABEL org.opencontainers.image.source="https://github.com/cytokineking/FreeBindCraft"
-LABEL org.opencontainers.image.description="FreeBindCraft GPU (no PyRosetta)"
+LABEL org.opencontainers.image.source="https://github.com/hector-s-m/BindCraft-Maturation"
+LABEL org.opencontainers.image.description="BindCraft-Maturation GPU (no PyRosetta)"
 LABEL org.opencontainers.image.licenses="MIT"
 
 ENV DEBIAN_FRONTEND=noninteractive \
