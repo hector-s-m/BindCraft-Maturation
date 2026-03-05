@@ -924,11 +924,9 @@ while True:
                                             target_settings["chains"], target_settings.get("target_hotspot_residues", ""),
                                             length, mat_current_seq, list(mat_fixed_set), seed,
                                             helicity_value, design_models, advanced_settings,
-                                            design_paths, failure_csv,
-                                            maturation_pdb=mat_current_pdb)
+                                            design_paths, failure_csv)
                                     except Exception as e:
                                         print(f"  Maturation hallucination failed at round {mat_round}: {e}")
-                                        clear_mem()
                                         break
 
                                     mat_traj_contacts = hotspot_residues(mat_traj_pdb, binder_chain)
@@ -1140,11 +1138,9 @@ while True:
                                                 target_settings["chains"], target_settings.get("target_hotspot_residues", ""),
                                                 length, mat_current_seq, list(mat_fixed_set), seed,
                                                 helicity_value, design_models, advanced_settings,
-                                                design_paths, failure_csv,
-                                                maturation_pdb=mat_current_pdb)
+                                                design_paths, failure_csv)
                                         except Exception as e:
                                             print(f"  Maturation hallucination failed at round {mat_round}: {e}")
-                                            clear_mem()
                                             break
 
                                         mat_traj_contacts = hotspot_residues(mat_traj_pdb, binder_chain)

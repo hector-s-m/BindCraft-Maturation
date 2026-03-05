@@ -163,7 +163,8 @@ def _minimize_shell(pose, pose_resid, shell_dist, scorefxn):
 
     # Add coordinate constraints to keep backbone close to starting position
     from pyrosetta.rosetta.protocols.relax import add_coordinate_constraints_to_pose
-    add_coordinate_constraints_to_pose(pose, scorefxn)
+    constraint_ref_pose = pose.clone()
+    add_coordinate_constraints_to_pose(pose, constraint_ref_pose)
 
     minmover = MinMover()
     minmover.movemap(mmf)
