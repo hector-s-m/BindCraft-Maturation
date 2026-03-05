@@ -1,14 +1,87 @@
-# FreeBindCraft
+# BindCraft-Maturation
 
-A modified [BindCraft v1.52](https://github.com/martinpacesa/BindCraft) for de novo protein binder design. FreeBindCraft adds an **optional PyRosetta bypass** (`--no-pyrosetta`) using fully open-source tools and a **PPIFlow-inspired affinity maturation** pipeline for iterative interface refinement.
+A modified version of [BindCraft](https://github.com/martinpacesa/BindCraft) / [FreeBindCraft](https://github.com/cytokineking/FreeBindCraft) with [PPIFlow](https://github.com/Yottaxx/PPIFlow)-inspired affinity maturation for recursive interface refinement.
 
-Fork: [https://github.com/cytokineking/FreeBindCraft](https://github.com/cytokineking/FreeBindCraft)
+Built on BindCraft v1.52 with FreeBindCraft's **optional PyRosetta bypass** (`--no-pyrosetta`) using fully open-source tools (OpenMM, FreeSASA, sc-rs).
 
 For the original BindCraft pipeline, settings, and filter documentation, see the [original repository](https://github.com/martinpacesa/BindCraft) and [preprint](https://www.biorxiv.org/content/10.1101/2024.09.30.615802).
 
 ---
 
 ## Features
+
+### Affinity Maturation (PPIFlow-Inspired)
+
+Opt-in recursive interface refinement that improves binder affinity after the initial design. Enabled via `"enable_maturation": true` in advanced settings.
+
+**Pipeline modes:**
+
+- **Post-filter** (`maturation_pre_filters: false`, default): hallucination → MPNN → AF2 validate → relax → filter check → maturation (on accepted designs only)
+- **Pre-filter** (`maturation_pre_filters: true`): hallucination → MPNN → AF2 validate → relax → maturation → filter check (increases acceptance rates by maturing before filtering)
+
+**How it works:**
+
+1. **Quality assessment** — Score each interface residue against hard AND thresholds (must pass ALL):
+   - Per-residue REU ≤ -5.0
+   - Per-residue pLDDT ≥ 0.85
+   - Per-residue PAE ≤ 5.0
+   - Secondary structure filter (off by default — loop residues can be fixed if they pass the above)
+2. **Partition** — Residues passing ALL thresholds are marked "high quality" and fixed; the rest are redesignable. The fixed set is **monotonically growing** — once fixed, always fixed
+3. **Saturation scan** — Each fixed residue is tested with all candidate amino acids (GLY/CYS excluded) via a two-pass strategy: (1) fast repack-only screen, (2) expensive minimize on top 3 candidates. Scored by target-only interaction REU. Safeguards include H-bond preservation and post-scan dG sanity gating
+4. **Re-hallucination** — AF2 redesigns unfixed positions (via `af_model.opt["fix_pos"]`) while frozen positions retain their identity
+5. **MPNN + validation** — ProteinMPNN sequence optimization, AF2 prediction, relaxation, and re-scoring
+6. **Convergence check** — Stops when both i_pTM and ipSAE fail to improve by their respective thresholds, or all interface residues are fixed
+
+**Maturation settings** (in advanced settings JSON):
+
+```json
+{
+    "enable_maturation": true,
+    "maturation_pre_filters": false,
+    "maturation_max_rounds": 3,
+    "maturation_improvement_metric": "i_pTM",
+    "maturation_improvement_threshold": 0.01,
+    "maturation_ipsae_improvement_threshold": 0.01,
+    "maturation_require_defined_ss": false,
+    "maturation_reu_threshold": -5.0,
+    "maturation_plddt_threshold": 0.85,
+    "maturation_pae_threshold": 5.0,
+    "maturation_contact_distance": 4.0,
+    "maturation_scan_repack_shell": 8.0,
+    "maturation_scan_exclude_aas": ["GLY", "CYS"],
+    "maturation_scan_minimize": true,
+    "maturation_scan_hbond_override_reu": -2.0,
+    "maturation_max_fix_fraction": 0.8,
+    "maturation_soft_iterations": 20,
+    "maturation_hard_iterations": 5,
+    "maturation_greedy_iterations": 10,
+    "maturation_num_seqs": 5,
+    "maturation_sampling_temp": 0.1
+}
+```
+
+Ready-to-use configs:
+- `settings_advanced/default_4stage_multimer_maturation.json` — conservative maturation (post-filter, 3 rounds)
+- `settings_advanced/maturation_bindcraft_flow.json` — aggressive maturation (pre-filter, 5 rounds, relaxed quality gates)
+
+> **Note:** Maturation requires PyRosetta for per-residue REU scoring and saturation scanning. It is not available with `--no-pyrosetta`.
+
+### Interface Scoring
+
+Beyond the standard BindCraft metrics, the following interface quality scores are computed for every design:
+
+| Metric | Source | Input |
+|---|---|---|
+| **ipSAE** | [Dunbrack et al. 2025](https://www.biorxiv.org/content/10.1101/2025.02.10.637595v1) | PAE matrix |
+| **pDockQ** | [Bryant et al. 2022](https://doi.org/10.1038/s41467-022-28865-w) | PDB + pLDDT |
+| **pDockQ2** | [Zhu et al. 2023](https://doi.org/10.1093/bioinformatics/btad424) | PDB + PAE + pLDDT |
+| **LIS** | [Kim et al. 2024](https://doi.org/10.1038/s41467-024-46863-2) | PAE matrix |
+
+All four are reported per-model and averaged across validation models in the output CSV.
+
+```bash
+python bindcraft.py --settings ... --rank-by ipSAE
+```
 
 ### PyRosetta Bypass (`--no-pyrosetta`)
 
@@ -23,58 +96,6 @@ Run the full design pipeline without a PyRosetta license:
 
 > Rosetta-specific metrics without open-source equivalents use placeholder values. Evaluate design quality accordingly.
 
-### ipSAE Scoring
-
-Interface predicted Structural Alignment Error ([Dunbrack et al. 2025](https://www.biorxiv.org/content/10.1101/2025.02.10.637595v1)) — a PTM-style scoring function with adaptive per-residue normalization. Higher scores = better predicted interface quality (range 0-1).
-
-```bash
-python bindcraft.py --settings ... --rank-by ipSAE
-```
-
-### Affinity Maturation (PPIFlow-Inspired)
-
-Opt-in recursive interface refinement that improves binder affinity after the initial design passes filters. Enabled via `"enable_maturation": true` in advanced settings.
-
-**How it works:**
-
-1. **Quality assessment** — Score each interface residue against hard AND thresholds:
-   - Per-residue REU <= -5.0
-   - Per-residue pLDDT >= 0.85
-   - Per-residue PAE <= 5.0
-   - Secondary structure = helix or sheet (not loop/coil)
-2. **Partition** — Residues passing ALL thresholds are marked "high quality" and fixed; the rest are redesignable
-3. **Saturation scan** — Each fixed residue is tested with all candidate amino acids (GLY/CYS excluded) via MutateResidue + neighborhood repack (8A shell) + constrained backbone minimization. Scored by target-only interaction REU. Safeguards include H-bond preservation and post-scan dG sanity gating
-4. **Re-hallucination** — AF2 redesigns unfixed positions (via `af_model.opt["fix_pos"]`) while frozen positions retain their identity
-5. **MPNN + validation** — ProteinMPNN sequence optimization, AF2 prediction, relaxation, and re-scoring
-6. **Convergence check** — Stops when improvement < threshold or all interface residues are fixed
-
-The fixed set is **monotonically growing** — once a residue passes all quality filters, it stays fixed in subsequent rounds.
-
-**Maturation settings** (in advanced settings JSON):
-
-```json
-{
-    "enable_maturation": true,
-    "maturation_max_rounds": 3,
-    "maturation_improvement_metric": "i_pTM",
-    "maturation_improvement_threshold": 0.01,
-    "maturation_require_defined_ss": true,
-    "maturation_reu_threshold": -5.0,
-    "maturation_plddt_threshold": 0.85,
-    "maturation_pae_threshold": 5.0,
-    "maturation_contact_distance": 4.0,
-    "maturation_scan_repack_shell": 8.0,
-    "maturation_scan_exclude_aas": ["GLY", "CYS"],
-    "maturation_scan_minimize": true,
-    "maturation_scan_hbond_override_reu": -2.0,
-    "maturation_max_fix_fraction": 0.8
-}
-```
-
-A ready-to-use config is provided at `settings_advanced/default_4stage_multimer_maturation.json`.
-
-> **Note:** Maturation requires PyRosetta for per-residue REU scoring and saturation scanning. It is not available with `--no-pyrosetta`.
-
 ---
 
 ## Installation
@@ -82,7 +103,7 @@ A ready-to-use config is provided at `settings_advanced/default_4stage_multimer_
 ### Option 1: Conda (recommended)
 
 ```bash
-git clone https://github.com/cytokineking/FreeBindCraft [install_folder]
+git clone https://github.com/hector-s-m/BindCraft-Maturation [install_folder]
 cd [install_folder]
 ```
 
@@ -120,10 +141,10 @@ See [Containerized Usage](#containerized-usage-docker) below.
 
 ```bash
 conda activate BindCraft
-cd /path/to/FreeBindCraft
+cd /path/to/BindCraft-Maturation
 ```
 
-**PyRosetta bypass:**
+**Standard (no PyRosetta):**
 ```bash
 python -u ./bindcraft.py \
   --settings './settings_target/your_target.json' \
@@ -193,12 +214,12 @@ From the project root:
 
 **Without PyRosetta:**
 ```bash
-docker build -f docker/Dockerfile -t freebindcraft:gpu .
+docker build -f docker/Dockerfile -t bindcraft-maturation:gpu .
 ```
 
 **With PyRosetta:**
 ```bash
-docker build -f docker/Dockerfile --build-arg WITH_PYROSETTA=true -t freebindcraft:pyrosetta .
+docker build -f docker/Dockerfile --build-arg WITH_PYROSETTA=true -t bindcraft-maturation:pyrosetta .
 ```
 
 ### Run
@@ -208,7 +229,7 @@ mkdir -p /path/on/host/run_outputs
 docker run --gpus all --rm -it \
   --ulimit nofile=65536:65536 \
   -v /path/on/host/run_outputs:/root/software/pdl1 \
-  freebindcraft:gpu \
+  bindcraft-maturation:gpu \
   python bindcraft.py \
     --settings settings_target/PDL1.json \
     --filters settings_filters/default_filters.json \
@@ -231,7 +252,7 @@ Guides you through image selection, GPU index, and all design parameters. Output
 ## Project Structure
 
 ```
-FreeBindCraft/
+BindCraft-Maturation/
   bindcraft.py                  # Main pipeline (AF2 hallucination -> MPNN -> validation -> maturation)
   install_bindcraft.sh          # Conda-based installation script
   requirements.txt              # pip dependencies
@@ -246,15 +267,15 @@ FreeBindCraft/
     pr_alternative_utils.py     # OpenMM relaxation, SASA, scoring (PyRosetta-free)
     pyrosetta_utils.py          # PyRosetta relaxation, scoring
     maturation_utils.py         # Quality assessment, residue partitioning, saturation scan
+    ipsae_utils.py              # Interface scoring: ipSAE, pDockQ, pDockQ2, LIS
     generic_utils.py            # CSV labels, directory setup, filter functions
     logging_utils.py            # Verbose timing utilities
-    dssp/                       # Bundled DSSP binary
+    dssp                        # Bundled DSSP binary
   settings_target/              # Target PDB configuration files
   settings_filters/             # Design filter profiles
   settings_advanced/            # Advanced pipeline settings (incl. maturation configs)
   extras/                       # Analysis and utility scripts (see extras/README.md)
   technical_overview/           # In-depth technical documentation
-  PPIFlow/                      # Reference implementation (not integrated into runtime)
 ```
 
 ---
@@ -264,11 +285,15 @@ FreeBindCraft/
 - **BindCraft**: [Pacesa et al. 2024](https://www.biorxiv.org/content/10.1101/2024.09.30.615802)
 - **ColabDesign / AlphaFold2**: [Jumper et al. 2021](https://doi.org/10.1038/s41586-021-03819-2)
 - **ProteinMPNN**: [Dauparas et al. 2022](https://doi.org/10.1126/science.add2187)
+- **PPIFlow**: [Zhu et al. 2024](https://arxiv.org/abs/2405.20459)
+- **ipSAE**: [Dunbrack et al. 2025](https://www.biorxiv.org/content/10.1101/2025.02.10.637595v1)
+- **pDockQ**: [Bryant et al. 2022](https://doi.org/10.1038/s41467-022-28865-w)
+- **pDockQ2**: [Zhu et al. 2023](https://doi.org/10.1093/bioinformatics/btad424)
+- **LIS**: [Kim et al. 2024](https://doi.org/10.1038/s41467-024-46863-2)
 - **sc-rs** (Shape Complementarity): [https://github.com/cytokineking/sc-rs](https://github.com/cytokineking/sc-rs)
-- **FreeSASA**: [https://github.com/mittinatten/freesasa](https://github.com/mittinatten/freesasa)
+- **FreeSASA**: [https://github.com/mittinafen/freesasa](https://github.com/mittinafen/freesasa)
 - **FASPR** (Side-chain Packing): [https://github.com/tommyhuangthu/FASPR](https://github.com/tommyhuangthu/FASPR)
 - **Biopython**: [https://biopython.org](https://biopython.org)
-- **ipSAE**: [Dunbrack et al. 2025](https://www.biorxiv.org/content/10.1101/2025.02.10.637595v1)
 
 ## Known Issues
 

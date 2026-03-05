@@ -10,3 +10,5 @@ BindCraft-main-v1.5.code-workspace
 ipSAE.py
 PPIFlow/
 performance_data/
+CLAUDE.md
+functions/ipsae.py
