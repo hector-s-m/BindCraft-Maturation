@@ -1,9 +1,9 @@
 {
-    "design_path": "/root/software/pdl1/",
+    "design_path": "designs/PDL1-mat/",
     "binder_name": "PDL1",
-    "starting_pdb": "./example/PDL1.pdb",
+    "starting_pdb": "targets/PDL1.pdb",
     "chains": "A",
     "target_hotspot_residues": "56",
-    "lengths": [65, 150],
+    "lengths": [60, 80],
     "number_of_final_designs": 100
 }
