@@ -1,6 +1,6 @@
 # BindCraft-Maturation
 
-A modified version of [BindCraft](https://github.com/martinpacesa/BindCraft) / [FreeBindCraft](https://github.com/cytokineking/FreeBindCraft) with [PPIFlow](https://github.com/Yottaxx/PPIFlow)-inspired affinity maturation for recursive interface refinement.
+A modified version of [BindCraft](https://github.com/martinpacesa/BindCraft) / [FreeBindCraft](https://github.com/cytokineking/FreeBindCraft) with [PPIFlow](https://github.com/Mingchenchen/PPIFlow)-inspired affinity maturation for recursive interface refinement.
 
 Built on BindCraft v1.52 with FreeBindCraft's **optional PyRosetta bypass** (`--no-pyrosetta`) using fully open-source tools (OpenMM, FreeSASA, sc-rs).
 
