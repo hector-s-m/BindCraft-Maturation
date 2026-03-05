@@ -1,0 +1,46 @@
+# FreeBindCraft dependencies
+# Install with: pip install -r requirements.txt
+# Note: Some packages (jax, jaxlib, pyrosetta) may require conda for GPU support.
+# See install_bindcraft.sh for the full conda-based installation.
+
+# Core scientific computing
+numpy<2.0.0
+scipy
+pandas
+
+# Protein structure and analysis
+biopython
+
+# Structure relaxation and fixing
+openmm
+pdbfixer
+
+# Machine learning / AlphaFold2
+jax==0.6.0
+jaxlib==0.6.0
+chex
+dm-haiku
+flax<0.10.0
+dm-tree
+ml-collections
+immutabledict
+optax
+
+# ColabDesign (AF2 hallucination + ProteinMPNN)
+colabdesign @ git+https://github.com/sokrypton/ColabDesign.git
+
+# Visualization
+matplotlib
+py3dmol
+seaborn
+
+# Optional: FreeSASA for accurate SASA calculations (falls back to Biopython if missing)
+freesasa
+
+# Utilities
+joblib
+tqdm
+fsspec
+
+# Optional: PyRosetta (requires conda from https://conda.rosettacommons.org)
+# pyrosetta

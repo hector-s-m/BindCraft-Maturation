@@ -1,0 +1,23 @@
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.pytest_cache
+
+# Git
+.git
+.gitignore
+
+# IDE/editor
+.vscode/
+.idea/
+*.code-workspace
+
+# OS
+.DS_Store
+
+# Large/unnecessary files
+PPIFlow/
+performance_data/
+technical_overview/
