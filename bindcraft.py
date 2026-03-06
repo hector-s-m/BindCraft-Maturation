@@ -602,16 +602,6 @@ def _run_maturation(cand, ctx, advanced_settings, mat_label="maturation"):
 
         mat_traj_contacts = hotspot_residues(mat_traj_pdb, binder_chain)
 
-        # Recreate prediction model — hallucination invalidates JAX PRNG key (prep_inputs alone doesn't reset it)
-        complex_prediction_model = mk_afdesign_model(protocol="binder", num_recycles=advanced_settings["num_recycles_validation"], data_dir=advanced_settings["af_params_dir"],
-                                                      use_multimer=multimer_validation, use_initial_guess=advanced_settings["predict_initial_guess"], use_initial_atom_pos=advanced_settings["predict_bigbang"])
-        if advanced_settings["predict_initial_guess"] or advanced_settings["predict_bigbang"]:
-            complex_prediction_model.prep_inputs(pdb_filename=trajectory_pdb, chain='A', binder_chain='B', binder_len=length, use_binder_template=True, rm_target_seq=advanced_settings["rm_template_seq_predict"],
-                                                rm_target_sc=advanced_settings["rm_template_sc_predict"], rm_template_ic=True)
-        else:
-            complex_prediction_model.prep_inputs(pdb_filename=target_settings["starting_pdb"], chain=target_settings["chains"], binder_len=length, rm_target_seq=advanced_settings["rm_template_seq_predict"],
-                                                rm_target_sc=advanced_settings["rm_template_sc_predict"])
-
         mat_fix_str = format_fixed_positions_for_mpnn(mat_fixed_set, binder_chain)
         try:
             mat_mpnn_seqs = mpnn_gen_sequence_maturation(
@@ -632,6 +622,19 @@ def _run_maturation(cand, ctx, advanced_settings, mat_label="maturation"):
         ]
         mat_best_seq = min(mat_seq_list, key=lambda x: x['score'])
         mat_mpnn_name = f"{mat_design_name}_mpnn1"
+
+        # Create prediction model AFTER MPNN — mpnn_gen_sequence_maturation() calls clear_mem()
+        # which destroys all live JAX arrays. Creating the model before MPNN causes the PRNG key
+        # to be deleted, resulting in "Array has been deleted with shape=uint32[2]" at predict time.
+        complex_prediction_model = mk_afdesign_model(protocol="binder", num_recycles=advanced_settings["num_recycles_validation"], data_dir=advanced_settings["af_params_dir"],
+                                                      use_multimer=multimer_validation, use_initial_guess=advanced_settings["predict_initial_guess"], use_initial_atom_pos=advanced_settings["predict_bigbang"])
+        if advanced_settings["predict_initial_guess"] or advanced_settings["predict_bigbang"]:
+            complex_prediction_model.prep_inputs(pdb_filename=trajectory_pdb, chain='A', binder_chain='B', binder_len=length, use_binder_template=True, rm_target_seq=advanced_settings["rm_template_seq_predict"],
+                                                rm_target_sc=advanced_settings["rm_template_sc_predict"], rm_template_ic=True)
+        else:
+            complex_prediction_model.prep_inputs(pdb_filename=target_settings["starting_pdb"], chain=target_settings["chains"], binder_len=length, rm_target_seq=advanced_settings["rm_template_seq_predict"],
+                                                rm_target_sc=advanced_settings["rm_template_sc_predict"])
+
         mat_pred_stats, mat_pass_af2, _ = predict_binder_complex(
             complex_prediction_model, mat_best_seq['seq'], mat_mpnn_name,
             target_settings["starting_pdb"], target_settings["chains"],

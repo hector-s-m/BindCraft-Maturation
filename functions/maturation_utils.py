@@ -176,8 +176,7 @@ def _minimize_shell(pose, pose_resid, shell_dist, scorefxn):
     minmover.apply(pose)
 
     # Remove coordinate constraints after minimization
-    from pyrosetta.rosetta.protocols.relax import remove_coordinate_constraints_from_pose
-    remove_coordinate_constraints_from_pose(pose)
+    pose.remove_constraints()
 
 
 def _count_target_hbonds(pose, pose_resid, target_pose_resids, scorefxn):
