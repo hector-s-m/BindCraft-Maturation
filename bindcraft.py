@@ -609,7 +609,7 @@ def _run_maturation(cand, ctx, advanced_settings, mat_label="maturation"):
             traceback.print_exc()
             break
 
-        if not mat_mpnn_seqs or not mat_mpnn_seqs.get('seq'):
+        if mat_mpnn_seqs is None or mat_mpnn_seqs.get('seq') is None or len(mat_mpnn_seqs['seq']) == 0:
             print(f"  No MPNN sequences generated at round {mat_round}, stopping")
             break
 
