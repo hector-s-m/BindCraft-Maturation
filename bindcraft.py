@@ -1196,15 +1196,19 @@ while True:
                         # Sort by ipSAE descending
                         ranked = sorted(maturation_candidates, key=lambda c: c['ipSAE'], reverse=True)
 
-                        # Count HQ residues for each candidate (no REU for ranking)
+                        # Count HQ residues for each candidate (including REU)
                         best_n_hq = 0
                         for candidate in ranked:
                             stats = candidate['complex_statistics'].get(candidate['best_model_number'], {})
+                            cand_reu = compute_per_residue_reu(
+                                candidate['best_model_pdb'], binder_chain=binder_chain,
+                                use_pyrosetta=use_pyrosetta)
                             n_hq = count_high_quality_residues(
                                 candidate['best_model_pdb'],
                                 stats.get('_pae_matrix'), stats.get('_plddt_array'),
                                 stats.get('_target_len'), stats.get('_binder_len'),
-                                advanced_settings, binder_chain=binder_chain)
+                                advanced_settings, binder_chain=binder_chain,
+                                per_residue_reu=cand_reu)
                             candidate['n_hq'] = n_hq
                             if n_hq > best_n_hq:
                                 best_n_hq = n_hq
