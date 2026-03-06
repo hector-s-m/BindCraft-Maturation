@@ -484,8 +484,10 @@ def _run_maturation(cand, ctx, advanced_settings, mat_label="maturation"):
     ctx is a dict with keys: complex_prediction_model, design_models, prediction_models,
         target_settings, length, seed, helicity_value, binder_chain, design_paths,
         failure_csv, mpnn_csv, use_pyrosetta, filters (for AF2 prediction).
-    Returns (mat_ran, updated_mpnn_data, updated_best_model_pdb).
+    Returns (mat_ran, updated_mpnn_data, updated_best_model_pdb, abandon_trajectory).
     mat_ran is True if at least one round completed with improvement.
+    abandon_trajectory is True if AF2 prediction failed 3 consecutive times,
+    signalling the caller to skip this trajectory and start fresh.
     """
     mpnn_data = list(cand['mpnn_data'])  # Copy to avoid mutating caller's data
     mpnn_design_name = cand['design_name']
@@ -525,7 +527,7 @@ def _run_maturation(cand, ctx, advanced_settings, mat_label="maturation"):
 
     if mat_pae is None or mat_plddt is None:
         vprint(f"[Maturation] Skipped: no cached PAE/pLDDT data available")
-        return False, mpnn_data, best_model_pdb
+        return False, mpnn_data, best_model_pdb, False
 
     mat_current_pdb = best_model_pdb
     mat_current_seq = cand['sequence']
@@ -543,6 +545,7 @@ def _run_maturation(cand, ctx, advanced_settings, mat_label="maturation"):
     new_redesign = set()
     mat_averages = mpnn_complex_averages
     mat_best_averages = None  # Set when a round improves
+    abandon_trajectory = False
 
     for mat_round in range(1, mat_max_rounds + 1):
         # Step 0: Compute per-residue REU (primary quality metric)
@@ -588,61 +591,75 @@ def _run_maturation(cand, ctx, advanced_settings, mat_label="maturation"):
                 print(f"  [Scan] {len(scan_mutations)} mutations accepted: {mut_str}")
 
         mat_design_name = f"{mpnn_design_name}_mat{mat_round}"
-        try:
-            mat_af_model, mat_traj_pdb = binder_maturation_hallucination(
-                mat_design_name, target_settings["starting_pdb"],
-                target_settings["chains"], target_settings.get("target_hotspot_residues", ""),
-                length, mat_current_seq, list(mat_fixed_set), seed,
-                helicity_value, design_models, advanced_settings,
-                design_paths, failure_csv)
-        except Exception as e:
-            print(f"  Maturation hallucination failed at round {mat_round}: {e}")
-            traceback.print_exc()
-            break
+        mat_max_retries = advanced_settings.get("maturation_af2_max_retries", 3)
 
-        mat_traj_contacts = hotspot_residues(mat_traj_pdb, binder_chain)
+        # Retry loop: on AF2 failure, redo hallucination → MPNN → predict.
+        # After mat_max_retries consecutive failures, abandon the trajectory.
+        mat_round_succeeded = False
+        for mat_attempt in range(1, mat_max_retries + 1):
+            attempt_suffix = f" (attempt {mat_attempt}/{mat_max_retries})" if mat_attempt > 1 else ""
+            try:
+                mat_af_model, mat_traj_pdb = binder_maturation_hallucination(
+                    mat_design_name, target_settings["starting_pdb"],
+                    target_settings["chains"], target_settings.get("target_hotspot_residues", ""),
+                    length, mat_current_seq, list(mat_fixed_set), seed,
+                    helicity_value, design_models, advanced_settings,
+                    design_paths, failure_csv)
+            except Exception as e:
+                print(f"  Maturation hallucination failed at round {mat_round}{attempt_suffix}: {e}")
+                traceback.print_exc()
+                continue
 
-        mat_fix_str = format_fixed_positions_for_mpnn(mat_fixed_set, binder_chain)
-        try:
-            mat_mpnn_seqs = mpnn_gen_sequence_maturation(
-                mat_traj_pdb, binder_chain, mat_fix_str, advanced_settings)
-        except Exception as e:
-            print(f"  Maturation MPNN failed at round {mat_round}: {e}")
-            traceback.print_exc()
-            break
+            mat_traj_contacts = hotspot_residues(mat_traj_pdb, binder_chain)
 
-        if mat_mpnn_seqs is None or mat_mpnn_seqs.get('seq') is None or len(mat_mpnn_seqs['seq']) == 0:
-            print(f"  No MPNN sequences generated at round {mat_round}, stopping")
-            break
+            mat_fix_str = format_fixed_positions_for_mpnn(mat_fixed_set, binder_chain)
+            try:
+                mat_mpnn_seqs = mpnn_gen_sequence_maturation(
+                    mat_traj_pdb, binder_chain, mat_fix_str, advanced_settings)
+            except Exception as e:
+                print(f"  Maturation MPNN failed at round {mat_round}{attempt_suffix}: {e}")
+                traceback.print_exc()
+                continue
 
-        mat_seq_list = [
-            {'seq': mat_mpnn_seqs['seq'][n][-length:],
-             'score': mat_mpnn_seqs['score'][n]}
-            for n in range(len(mat_mpnn_seqs['seq']))
-        ]
-        mat_best_seq = min(mat_seq_list, key=lambda x: x['score'])
-        mat_mpnn_name = f"{mat_design_name}_mpnn1"
+            if mat_mpnn_seqs is None or mat_mpnn_seqs.get('seq') is None or len(mat_mpnn_seqs['seq']) == 0:
+                print(f"  No MPNN sequences generated at round {mat_round}{attempt_suffix}")
+                continue
 
-        # Create prediction model AFTER MPNN — mpnn_gen_sequence_maturation() calls clear_mem()
-        # which destroys all live JAX arrays. Creating the model before MPNN causes the PRNG key
-        # to be deleted, resulting in "Array has been deleted with shape=uint32[2]" at predict time.
-        complex_prediction_model = mk_afdesign_model(protocol="binder", num_recycles=advanced_settings["num_recycles_validation"], data_dir=advanced_settings["af_params_dir"],
-                                                      use_multimer=multimer_validation, use_initial_guess=advanced_settings["predict_initial_guess"], use_initial_atom_pos=advanced_settings["predict_bigbang"])
-        if advanced_settings["predict_initial_guess"] or advanced_settings["predict_bigbang"]:
-            complex_prediction_model.prep_inputs(pdb_filename=trajectory_pdb, chain='A', binder_chain='B', binder_len=length, use_binder_template=True, rm_target_seq=advanced_settings["rm_template_seq_predict"],
-                                                rm_target_sc=advanced_settings["rm_template_sc_predict"], rm_template_ic=True)
-        else:
-            complex_prediction_model.prep_inputs(pdb_filename=target_settings["starting_pdb"], chain=target_settings["chains"], binder_len=length, rm_target_seq=advanced_settings["rm_template_seq_predict"],
-                                                rm_target_sc=advanced_settings["rm_template_sc_predict"])
+            mat_seq_list = [
+                {'seq': mat_mpnn_seqs['seq'][n][-length:],
+                 'score': mat_mpnn_seqs['score'][n]}
+                for n in range(len(mat_mpnn_seqs['seq']))
+            ]
+            mat_best_seq = min(mat_seq_list, key=lambda x: x['score'])
+            mat_mpnn_name = f"{mat_design_name}_mpnn1"
 
-        mat_pred_stats, mat_pass_af2, _ = predict_binder_complex(
-            complex_prediction_model, mat_best_seq['seq'], mat_mpnn_name,
-            target_settings["starting_pdb"], target_settings["chains"],
-            length, mat_traj_pdb, prediction_models, advanced_settings,
-            filters, design_paths, failure_csv, use_pyrosetta=use_pyrosetta)
+            # Create prediction model AFTER MPNN — mpnn_gen_sequence_maturation() calls clear_mem()
+            # which destroys all live JAX arrays. Creating the model before MPNN causes the PRNG key
+            # to be deleted, resulting in "Array has been deleted with shape=uint32[2]" at predict time.
+            complex_prediction_model = mk_afdesign_model(protocol="binder", num_recycles=advanced_settings["num_recycles_validation"], data_dir=advanced_settings["af_params_dir"],
+                                                          use_multimer=multimer_validation, use_initial_guess=advanced_settings["predict_initial_guess"], use_initial_atom_pos=advanced_settings["predict_bigbang"])
+            if advanced_settings["predict_initial_guess"] or advanced_settings["predict_bigbang"]:
+                complex_prediction_model.prep_inputs(pdb_filename=trajectory_pdb, chain='A', binder_chain='B', binder_len=length, use_binder_template=True, rm_target_seq=advanced_settings["rm_template_seq_predict"],
+                                                    rm_target_sc=advanced_settings["rm_template_sc_predict"], rm_template_ic=True)
+            else:
+                complex_prediction_model.prep_inputs(pdb_filename=target_settings["starting_pdb"], chain=target_settings["chains"], binder_len=length, rm_target_seq=advanced_settings["rm_template_seq_predict"],
+                                                    rm_target_sc=advanced_settings["rm_template_sc_predict"])
 
-        if not mat_pass_af2:
-            print(f"  Maturation round {mat_round}: AF2 prediction failed, stopping")
+            mat_pred_stats, mat_pass_af2, _ = predict_binder_complex(
+                complex_prediction_model, mat_best_seq['seq'], mat_mpnn_name,
+                target_settings["starting_pdb"], target_settings["chains"],
+                length, mat_traj_pdb, prediction_models, advanced_settings,
+                filters, design_paths, failure_csv, use_pyrosetta=use_pyrosetta)
+
+            if mat_pass_af2:
+                mat_round_succeeded = True
+                break
+            else:
+                print(f"  Maturation round {mat_round}: AF2 prediction failed{attempt_suffix}, retrying...")
+
+        if not mat_round_succeeded:
+            print(f"  Maturation round {mat_round}: AF2 failed {mat_max_retries} consecutive times, abandoning trajectory")
+            abandon_trajectory = True
             break
 
         for mat_model_num in prediction_models:
@@ -681,6 +698,8 @@ def _run_maturation(cand, ctx, advanced_settings, mat_label="maturation"):
             if mat_best_model_stats.get('_pae_matrix') is not None:
                 mat_pae = mat_best_model_stats['_pae_matrix']
                 mat_plddt = mat_best_model_stats['_plddt_array']
+                mat_target_len = mat_best_model_stats.get('_target_len', mat_target_len)
+                mat_binder_len = mat_best_model_stats.get('_binder_len', mat_binder_len)
             mat_relaxed_best = os.path.join(design_paths["MPNN/Maturation"],
                                              f"{mat_mpnn_name}_model{mat_best_model_num}.pdb")
             if os.path.exists(mat_relaxed_best):
@@ -727,7 +746,7 @@ def _run_maturation(cand, ctx, advanced_settings, mat_label="maturation"):
         print(f"--- {mat_label.capitalize()} maturation complete: {mat_rounds_completed} rounds, "
               f"{mat_metric_name} {iptm_summary}{ipsae_summary} ---\n")
 
-    return mat_ran, mpnn_data, best_model_pdb
+    return mat_ran, mpnn_data, best_model_pdb, abandon_trajectory
 
 
 def _check_maturation_revert(mat_ran, mat_revert_on_worse, cand_mpnn_data,
@@ -1289,8 +1308,12 @@ while True:
                                 ############################################
                                 ### Pre-filter maturation: mature first, then filter check
                                 ############################################
-                                mat_ran, cand_mpnn_data, cand_best_model_pdb = _run_maturation(
+                                mat_ran, cand_mpnn_data, cand_best_model_pdb, abandon_trajectory = _run_maturation(
                                     cand, ctx, advanced_settings, mat_label="pre-filter")
+
+                                if abandon_trajectory:
+                                    print(f"  Abandoning trajectory due to repeated AF2 failures")
+                                    break
 
                                 if not mat_ran and cand_idx < len(eligible_candidates) - 1:
                                     print(f"  Maturation failed for {cand_design_name}, trying next candidate...")
@@ -1334,8 +1357,14 @@ while True:
                                     accepted_mpnn += 1
                                     accepted_designs += 1
 
-                                    mat_ran, cand_mpnn_data, cand_best_model_pdb = _run_maturation(
+                                    mat_ran, cand_mpnn_data, cand_best_model_pdb, abandon_trajectory = _run_maturation(
                                         cand, ctx, advanced_settings, mat_label="post-filter")
+
+                                    if abandon_trajectory:
+                                        print(f"  Abandoning trajectory due to repeated AF2 failures")
+                                        accepted_mpnn -= 1
+                                        accepted_designs -= 1
+                                        break
 
                                     if not mat_ran and cand_idx < len(eligible_candidates) - 1:
                                         print(f"  Maturation failed for {cand_design_name}, trying next candidate...")
