@@ -870,8 +870,9 @@ while True:
         print("")
 
         # Skip trajectory if ipSAE is too low (not worth relaxing and scoring)
+        # ipSAE is stored in trajectory.aux["log"], not in _tmp["best"]["aux"]["log"]
         min_traj_ipsae = advanced_settings.get("min_trajectory_ipsae", 0.4)
-        traj_ipsae_val = trajectory_metrics.get('ipSAE', None)
+        traj_ipsae_val = trajectory.aux["log"].get("ipSAE", None)
         if traj_ipsae_val is not None and traj_ipsae_val < min_traj_ipsae:
             print(f"Trajectory ipSAE ({traj_ipsae_val:.4f}) below threshold ({min_traj_ipsae}), skipping")
             continue
