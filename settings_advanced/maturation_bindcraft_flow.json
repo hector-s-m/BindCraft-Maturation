@@ -71,6 +71,7 @@
     "maturation_improvement_metric": "i_pTM",
     "maturation_improvement_threshold": 0.005,
     "maturation_ipsae_improvement_threshold": 0.01,
+    "maturation_revert_on_worse": true,
     "_comment_maturation_thresholds": "Hard AND thresholds: residue must pass ALL to be fixed. Relaxed vs default to fix more residues early.",
     "maturation_require_defined_ss": false,
     "maturation_reu_threshold": -5.0,

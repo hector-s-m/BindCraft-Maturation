@@ -683,6 +683,18 @@ def assess_interface_residue_quality(pdb_file, pae_matrix, plddt_array,
     return quality_results
 
 
+def count_high_quality_residues(pdb_file, pae_matrix, plddt_array,
+                                target_len, binder_len, advanced_settings,
+                                binder_chain="B"):
+    """Count interface residues passing all quality filters (no REU). For maturation candidate ranking."""
+    if pae_matrix is None or plddt_array is None:
+        return 0
+    quality = assess_interface_residue_quality(
+        pdb_file, pae_matrix, plddt_array, target_len, binder_len,
+        advanced_settings, binder_chain=binder_chain, per_residue_reu=None)
+    return sum(1 for v in quality.values() if v['is_high_quality'])
+
+
 def partition_interface_residues(residue_quality, existing_fixed_set, advanced_settings):
     """
     Partition interface residues into fixed (high quality) and redesignable sets.

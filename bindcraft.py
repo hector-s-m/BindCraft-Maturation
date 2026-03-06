@@ -4,12 +4,13 @@
 ### Import dependencies
 import gc
 from functions import *
-from functions.generic_utils import insert_data # Explicit import for insert_data
+from functions.generic_utils import insert_data, maturation_col_start, MAT_ROUNDS, MAT_CONVERGED, MAT_FIXED_RES, MAT_REDESIGN_RES, MAT_PRE_IPTM, MAT_POST_IPTM, MAT_PRE_IPSAE, MAT_POST_IPSAE, MAT_SCAN_MUTATIONS
 from functions.biopython_utils import clear_dssp_cache # Explicit import for DSSP cache management
 import logging
 import os
 import sys
 import subprocess
+import traceback
 try:
     import resource  # POSIX-only; used to raise RLIMIT_NOFILE (ulimit -n)
 except Exception:
@@ -475,6 +476,332 @@ script_start_time = time.time()
 trajectory_n = 1
 accepted_designs = 0
 
+### Helper functions for Phase 3 processing
+
+def _run_maturation(cand, ctx, advanced_settings, mat_label="maturation"):
+    """
+    Run the maturation loop on a single candidate.
+    ctx is a dict with keys: complex_prediction_model, design_models, prediction_models,
+        target_settings, length, seed, helicity_value, binder_chain, design_paths,
+        failure_csv, mpnn_csv, use_pyrosetta, filters (for AF2 prediction).
+    Returns (mat_ran, updated_mpnn_data, updated_best_model_pdb).
+    mat_ran is True if at least one round completed with improvement.
+    """
+    mpnn_data = list(cand['mpnn_data'])  # Copy to avoid mutating caller's data
+    mpnn_design_name = cand['design_name']
+    best_model_pdb = cand['best_model_pdb']
+    best_model_number = cand['best_model_number']
+    mpnn_complex_averages = cand['complex_averages']
+    mpnn_complex_statistics = cand['complex_statistics']
+
+    # Unpack context
+    complex_prediction_model = ctx['complex_prediction_model']
+    design_models = ctx['design_models']
+    prediction_models = ctx['prediction_models']
+    target_settings = ctx['target_settings']
+    length = ctx['length']
+    seed = ctx['seed']
+    helicity_value = ctx['helicity_value']
+    binder_chain = ctx['binder_chain']
+    design_paths = ctx['design_paths']
+    failure_csv = ctx['failure_csv']
+    mpnn_csv = ctx['mpnn_csv']
+    use_pyrosetta = ctx['use_pyrosetta']
+    filters = ctx['filters']
+
+    mat_max_rounds = advanced_settings.get("maturation_max_rounds", 3)
+    mat_metric_name = advanced_settings.get("maturation_improvement_metric", "i_pTM")
+    mat_improvement_thresh = advanced_settings.get("maturation_improvement_threshold", 0.01)
+    mat_ipsae_thresh = advanced_settings.get("maturation_ipsae_improvement_threshold", 0.01)
+
+    # Get cached PAE/pLDDT from the best model's prediction
+    best_pred_stats = mpnn_complex_statistics.get(best_model_number, {})
+    mat_pae = best_pred_stats.get('_pae_matrix')
+    mat_plddt = best_pred_stats.get('_plddt_array')
+    mat_target_len = best_pred_stats.get('_target_len')
+    mat_binder_len = best_pred_stats.get('_binder_len')
+
+    if mat_pae is None or mat_plddt is None:
+        vprint(f"[Maturation] Skipped: no cached PAE/pLDDT data available")
+        return False, mpnn_data, best_model_pdb
+
+    mat_current_pdb = best_model_pdb
+    mat_current_seq = cand['sequence']
+    mat_best_metric = get_maturation_metric(mpnn_complex_averages, mat_metric_name)
+    mat_best_ipsae = mpnn_complex_averages.get('ipSAE', None)
+    mat_pre_metric_iptm = mpnn_complex_averages.get('i_pTM', None)
+    mat_pre_metric_ipsae = mat_best_ipsae
+    ipsae_str = f", ipSAE: {mat_pre_metric_ipsae:.4f}" if mat_pre_metric_ipsae is not None else ""
+    print(f"\n--- Starting {mat_label} maturation for {mpnn_design_name} (max {mat_max_rounds} rounds) ---")
+    print(f"  Baseline: {mat_metric_name}={mat_best_metric:.4f}{ipsae_str}")
+    mat_fixed_set = set()
+    mat_rounds_completed = 0
+    mat_converged = False
+    mat_all_scan_mutations = []
+    new_redesign = set()
+    mat_averages = mpnn_complex_averages
+    mat_best_averages = None  # Set when a round improves
+
+    for mat_round in range(1, mat_max_rounds + 1):
+        # Step 0: Compute per-residue REU (primary quality metric)
+        mat_per_residue_reu, mat_pose, mat_scorefxn = compute_per_residue_reu(
+            mat_current_pdb, binder_chain=binder_chain,
+            use_pyrosetta=use_pyrosetta, return_pose=True)
+        if mat_per_residue_reu is not None:
+            vprint(f"  [Maturation] Per-residue REU computed for {len(mat_per_residue_reu)} residues")
+        else:
+            vprint(f"  [Maturation] REU unavailable, using pLDDT/PAE/contacts only")
+
+        residue_quality = assess_interface_residue_quality(
+            mat_current_pdb, mat_pae, mat_plddt,
+            mat_target_len, mat_binder_len,
+            advanced_settings, binder_chain=binder_chain,
+            per_residue_reu=mat_per_residue_reu)
+
+        if not residue_quality:
+            print(f"  Maturation round {mat_round}: no interface residues found, stopping")
+            break
+
+        new_fixed, new_redesign, mat_converged = partition_interface_residues(
+            residue_quality, mat_fixed_set, advanced_settings)
+        mat_fixed_set = new_fixed
+
+        if mat_converged:
+            print(f"  Maturation converged at round {mat_round} — all interface residues are high quality")
+            break
+
+        if mat_fixed_set and use_pyrosetta:
+            scan_output = os.path.join(design_paths["MPNN/Maturation"],
+                                       f"{mpnn_design_name}_mat{mat_round}_scanned.pdb")
+            scan_seq, scan_mutations = scan_fixed_residues(
+                mat_current_pdb, mat_fixed_set, binder_chain,
+                advanced_settings, scan_output,
+                preloaded_pose=mat_pose,
+                preloaded_scorefxn=mat_scorefxn)
+            if scan_mutations:
+                mat_current_pdb = scan_output
+                mat_current_seq = scan_seq
+                mat_all_scan_mutations.extend(scan_mutations)
+                mut_str = ', '.join(f"{old}{idx+1}{new}" for idx, old, new, _, _ in scan_mutations)
+                print(f"  [Scan] {len(scan_mutations)} mutations accepted: {mut_str}")
+
+        mat_design_name = f"{mpnn_design_name}_mat{mat_round}"
+        try:
+            mat_af_model, mat_traj_pdb = binder_maturation_hallucination(
+                mat_design_name, target_settings["starting_pdb"],
+                target_settings["chains"], target_settings.get("target_hotspot_residues", ""),
+                length, mat_current_seq, list(mat_fixed_set), seed,
+                helicity_value, design_models, advanced_settings,
+                design_paths, failure_csv)
+        except Exception as e:
+            print(f"  Maturation hallucination failed at round {mat_round}: {e}")
+            traceback.print_exc()
+            break
+
+        mat_traj_contacts = hotspot_residues(mat_traj_pdb, binder_chain)
+
+        mat_fix_str = format_fixed_positions_for_mpnn(mat_fixed_set, binder_chain)
+        try:
+            mat_mpnn_seqs = mpnn_gen_sequence_maturation(
+                mat_traj_pdb, binder_chain, mat_fix_str, advanced_settings)
+        except Exception as e:
+            print(f"  Maturation MPNN failed at round {mat_round}: {e}")
+            traceback.print_exc()
+            break
+
+        if not mat_mpnn_seqs or not mat_mpnn_seqs.get('seq'):
+            print(f"  No MPNN sequences generated at round {mat_round}, stopping")
+            break
+
+        mat_seq_list = [
+            {'seq': mat_mpnn_seqs['seq'][n][-length:],
+             'score': mat_mpnn_seqs['score'][n]}
+            for n in range(len(mat_mpnn_seqs['seq']))
+        ]
+        mat_best_seq = min(mat_seq_list, key=lambda x: x['score'])
+        mat_mpnn_name = f"{mat_design_name}_mpnn1"
+        mat_pred_stats, mat_pass_af2, _ = predict_binder_complex(
+            complex_prediction_model, mat_best_seq['seq'], mat_mpnn_name,
+            target_settings["starting_pdb"], target_settings["chains"],
+            length, mat_traj_pdb, prediction_models, advanced_settings,
+            filters, design_paths, failure_csv, use_pyrosetta=use_pyrosetta)
+
+        if not mat_pass_af2:
+            print(f"  Maturation round {mat_round}: AF2 prediction failed, stopping")
+            break
+
+        for mat_model_num in prediction_models:
+            mat_mpnn_pdb = os.path.join(design_paths["MPNN"], f"{mat_mpnn_name}_model{mat_model_num+1}.pdb")
+            mat_relaxed_pdb = os.path.join(design_paths["MPNN/Maturation"], f"{mat_mpnn_name}_model{mat_model_num+1}.pdb")
+            if os.path.exists(mat_mpnn_pdb):
+                try:
+                    pr_relax(mat_mpnn_pdb, mat_relaxed_pdb, use_pyrosetta=use_pyrosetta)
+                except Exception as e:
+                    print(f"  Maturation relax failed for model {mat_model_num+1}: {e}")
+                    traceback.print_exc()
+                    shutil.copy(mat_mpnn_pdb, mat_relaxed_pdb)
+
+        mat_averages = calculate_averages(mat_pred_stats, handle_aa=False)
+        mat_new_metric = get_maturation_metric(mat_averages, mat_metric_name)
+
+        mat_new_ipsae = mat_averages.get('ipSAE', None)
+        log_maturation_round(mat_round, mat_fixed_set, new_redesign,
+                             residue_quality, mat_metric_name,
+                             mat_best_metric, mat_new_metric,
+                             ipsae=mat_new_ipsae)
+
+        metric_improved = mat_new_metric > mat_best_metric + mat_improvement_thresh
+        if mat_new_ipsae is not None and mat_best_ipsae is not None:
+            ipsae_improved = mat_new_ipsae > mat_best_ipsae + mat_ipsae_thresh
+        else:
+            ipsae_improved = True
+
+        if metric_improved and ipsae_improved:
+            mat_best_metric = mat_new_metric
+            mat_best_ipsae = mat_new_ipsae
+            mat_current_seq = mat_best_seq['seq']
+            mat_model_plddt = {m: mat_pred_stats[m].get('pLDDT', 0) for m in mat_pred_stats if not str(m).startswith('_')}
+            mat_best_model_num = max(mat_model_plddt, key=mat_model_plddt.get) if mat_model_plddt else best_model_number
+            mat_best_model_stats = mat_pred_stats.get(mat_best_model_num, {})
+            if mat_best_model_stats.get('_pae_matrix') is not None:
+                mat_pae = mat_best_model_stats['_pae_matrix']
+                mat_plddt = mat_best_model_stats['_plddt_array']
+            mat_relaxed_best = os.path.join(design_paths["MPNN/Maturation"],
+                                             f"{mat_mpnn_name}_model{mat_best_model_num}.pdb")
+            if os.path.exists(mat_relaxed_best):
+                mat_current_pdb = mat_relaxed_best
+                best_model_pdb = mat_relaxed_best
+            mat_rounds_completed = mat_round
+            mat_best_averages = mat_averages
+        else:
+            reasons = []
+            if not metric_improved:
+                reasons.append(f"{mat_metric_name} {mat_new_metric - mat_best_metric:+.4f} < {mat_improvement_thresh}")
+            if not ipsae_improved:
+                delta = (mat_new_ipsae or 0) - (mat_best_ipsae or 0)
+                reasons.append(f"ipSAE {delta:+.4f} < {mat_ipsae_thresh}")
+            print(f"  No improvement at round {mat_round} ({'; '.join(reasons)}), stopping maturation")
+            break
+
+    # Update maturation columns in mpnn_data
+    mat_post_iptm = mpnn_complex_averages.get('i_pTM', None) if mat_rounds_completed == 0 else mat_best_averages.get('i_pTM', None)
+    mat_post_ipsae = mpnn_complex_averages.get('ipSAE', None) if mat_rounds_completed == 0 else mat_best_averages.get('ipSAE', None)
+    fixed_res_str = ','.join(str(i) for i in sorted(mat_fixed_set))
+    redesign_res_str = ','.join(str(i) for i in sorted(new_redesign)) if not mat_converged else ''
+
+    mcs = maturation_col_start(mpnn_data)
+    mpnn_data[mcs + MAT_ROUNDS] = mat_rounds_completed
+    mpnn_data[mcs + MAT_CONVERGED] = mat_converged
+    mpnn_data[mcs + MAT_FIXED_RES] = fixed_res_str
+    mpnn_data[mcs + MAT_REDESIGN_RES] = redesign_res_str
+    mpnn_data[mcs + MAT_PRE_IPTM] = mat_pre_metric_iptm
+    mpnn_data[mcs + MAT_POST_IPTM] = mat_post_iptm
+    mpnn_data[mcs + MAT_PRE_IPSAE] = mat_pre_metric_ipsae
+    mpnn_data[mcs + MAT_POST_IPSAE] = mat_post_ipsae
+    scan_mut_str = ' '.join(
+        f"{old}{idx+1}{new}({new_reu-old_reu:.1f})"
+        for idx, old, new, old_reu, new_reu in mat_all_scan_mutations
+    ) if mat_all_scan_mutations else ''
+    mpnn_data[mcs + MAT_SCAN_MUTATIONS] = scan_mut_str
+
+    mat_ran = mat_rounds_completed > 0
+    if mat_ran:
+        mpnn_data[6] = mat_current_seq
+        ipsae_summary = f", ipSAE {mat_pre_metric_ipsae:.4f} -> {mat_post_ipsae:.4f}" if mat_pre_metric_ipsae is not None and mat_post_ipsae is not None else ""
+        iptm_summary = f"{mat_pre_metric_iptm:.4f} -> {mat_post_iptm:.4f}" if mat_pre_metric_iptm is not None and mat_post_iptm is not None else "N/A"
+        print(f"--- {mat_label.capitalize()} maturation complete: {mat_rounds_completed} rounds, "
+              f"{mat_metric_name} {iptm_summary}{ipsae_summary} ---\n")
+
+    return mat_ran, mpnn_data, best_model_pdb
+
+
+def _check_maturation_revert(mat_ran, mat_revert_on_worse, cand_mpnn_data,
+                             cand_pre_mat_data, cand_pre_mat_pdb, cand_best_model_pdb):
+    """Check if maturation worsened i_pTM or ipSAE; revert if so.
+    Returns (reverted, mpnn_data, best_model_pdb, mat_ran)."""
+    if not mat_ran or not mat_revert_on_worse:
+        return False, cand_mpnn_data, cand_best_model_pdb, mat_ran
+
+    mcs = maturation_col_start(cand_mpnn_data)
+    mat_pre_iptm = cand_mpnn_data[mcs + MAT_PRE_IPTM]
+    mat_post_iptm = cand_mpnn_data[mcs + MAT_POST_IPTM]
+    mat_pre_ipsae = cand_mpnn_data[mcs + MAT_PRE_IPSAE]
+    mat_post_ipsae = cand_mpnn_data[mcs + MAT_POST_IPSAE]
+
+    reason = None
+    if mat_post_iptm is not None and mat_pre_iptm is not None and mat_post_iptm < mat_pre_iptm:
+        reason = f"i_pTM ({mat_pre_iptm:.4f} -> {mat_post_iptm:.4f})"
+    elif mat_post_ipsae is not None and mat_pre_ipsae is not None and mat_post_ipsae < mat_pre_ipsae:
+        reason = f"ipSAE ({mat_pre_ipsae:.4f} -> {mat_post_ipsae:.4f})"
+
+    if reason:
+        print(f"  Maturation worsened {reason}, reverting")
+        return True, cand_pre_mat_data, cand_pre_mat_pdb, False
+
+    return False, cand_mpnn_data, cand_best_model_pdb, mat_ran
+
+
+def _accept_design(best_model_pdb, mpnn_data, design_name,
+                   design_paths, final_csv, advanced_settings):
+    """Copy accepted design to Accepted folder, write to final CSV, copy animations/plots."""
+    shutil.copy(best_model_pdb, design_paths["Accepted"])
+
+    final_data = [''] + mpnn_data
+    insert_data(final_csv, final_data)
+
+    if advanced_settings["save_design_animations"]:
+        accepted_animation = os.path.join(design_paths["Accepted/Animation"], f"{design_name}.html")
+        if not os.path.exists(accepted_animation):
+            src_animation = os.path.join(design_paths["Trajectory/Animation"], f"{design_name}.html")
+            if os.path.exists(src_animation):
+                shutil.copy(src_animation, accepted_animation)
+
+    plot_files = os.listdir(design_paths["Trajectory/Plots"])
+    plots_to_copy = [f for f in plot_files if f.startswith(design_name) and f.endswith('.png')]
+    for accepted_plot in plots_to_copy:
+        source_plot = os.path.join(design_paths["Trajectory/Plots"], accepted_plot)
+        target_plot = os.path.join(design_paths["Accepted/Plots"], accepted_plot)
+        if not os.path.exists(target_plot):
+            shutil.copy(source_plot, target_plot)
+
+
+def _reject_design(design_name, best_model_pdb, mpnn_data,
+                   filter_conditions, failure_csv, design_paths,
+                   filter_column_names_for_rejected_log,
+                   rejected_mpnn_full_stats_csv, sequence):
+    """Log filter failures, update failure CSV, copy to Rejected folder."""
+    print(f"Unmet filter conditions for {design_name}")
+    failure_df = pd.read_csv(failure_csv)
+    special_prefixes = ('Average_', '1_', '2_', '3_', '4_', '5_')
+    incremented_columns = set()
+
+    for column in filter_conditions:
+        base_column = column
+        for prefix in special_prefixes:
+            if column.startswith(prefix):
+                base_column = column.split('_', 1)[1]
+                break
+
+        if base_column not in incremented_columns:
+            if base_column in failure_df.columns:
+                failure_df[base_column] = failure_df[base_column] + 1
+            else:
+                print(f"Warning: Base column '{base_column}' not found in {failure_csv}.")
+            incremented_columns.add(base_column)
+
+    failure_df.to_csv(failure_csv, index=False)
+
+    rejected_data_list_for_csv = [design_name, sequence]
+    for filter_col_name in filter_column_names_for_rejected_log:
+        if filter_col_name in incremented_columns:
+            rejected_data_list_for_csv.append(1)
+        else:
+            rejected_data_list_for_csv.append(0)
+    insert_data(rejected_mpnn_full_stats_csv, rejected_data_list_for_csv)
+
+    shutil.copy(best_model_pdb, design_paths["Rejected"])
+
+
 ### start design loop
 while True:
     ### check if we have the target number of binders
@@ -641,7 +968,8 @@ while True:
                                                                 data_dir=advanced_settings["af_params_dir"], use_multimer=multimer_validation)
                     binder_prediction_model.prep_inputs(length=length)
 
-                    # iterate over designed sequences        
+                    # iterate over designed sequences — Phase 1: predict and score all
+                    maturation_candidates = []
                     for mpnn_sequence in mpnn_sequences:
                         mpnn_time = time.time()
 
@@ -834,501 +1162,176 @@ while True:
                         best_model_number = highest_plddt_key - 10
                         best_model_pdb = os.path.join(design_paths["MPNN/Relaxed"], f"{mpnn_design_name}_model{best_model_number}.pdb")
 
-                        ############################################
-                        ### Recursive Affinity Maturation (PPIFlow-inspired)
-                        ### When maturation_pre_filters=True, runs BEFORE filter check
-                        ### When maturation_pre_filters=False (default), runs AFTER filter check
-                        ############################################
-                        mat_pre_filters = advanced_settings.get("maturation_pre_filters", False)
-                        mat_enabled = advanced_settings.get("enable_maturation", False)
-                        mat_ran = False
+                        # Collect candidate for Phase 2 selection
+                        maturation_candidates.append({
+                            'design_name': mpnn_design_name,
+                            'sequence': mpnn_sequence['seq'],
+                            'mpnn_data': mpnn_data,
+                            'complex_averages': mpnn_complex_averages,
+                            'complex_statistics': mpnn_complex_statistics,
+                            'best_model_number': best_model_number,
+                            'best_model_pdb': best_model_pdb,
+                            'ipSAE': mpnn_complex_averages.get('ipSAE', float('-inf')),
+                            'binder_statistics': binder_statistics,
+                            'binder_averages': binder_averages,
+                            'mpnn_score': mpnn_score,
+                            'mpnn_seqid': mpnn_seqid,
+                        })
 
-                        if mat_enabled and mat_pre_filters:
-                            mat_max_rounds = advanced_settings.get("maturation_max_rounds", 3)
-                            mat_metric_name = advanced_settings.get("maturation_improvement_metric", "i_pTM")
-                            mat_improvement_thresh = advanced_settings.get("maturation_improvement_threshold", 0.01)
-                            mat_ipsae_thresh = advanced_settings.get("maturation_ipsae_improvement_threshold", 0.01)
-
-                            # Get cached PAE/pLDDT from the best model's prediction
-                            best_pred_stats = mpnn_complex_statistics.get(best_model_number, {})
-                            mat_pae = best_pred_stats.get('_pae_matrix')
-                            mat_plddt = best_pred_stats.get('_plddt_array')
-                            mat_target_len = best_pred_stats.get('_target_len')
-                            mat_binder_len = best_pred_stats.get('_binder_len')
-
-                            if mat_pae is not None and mat_plddt is not None:
-                                mat_ran = True
-                                mat_current_pdb = best_model_pdb
-                                mat_current_seq = mpnn_sequence['seq']
-                                mat_best_metric = get_maturation_metric(mpnn_complex_averages, mat_metric_name)
-                                mat_best_ipsae = mpnn_complex_averages.get('ipSAE', None)
-                                mat_pre_metric_iptm = mpnn_complex_averages.get('i_pTM', None)
-                                mat_pre_metric_ipsae = mat_best_ipsae
-                                ipsae_str = f", ipSAE: {mat_pre_metric_ipsae:.4f}" if mat_pre_metric_ipsae is not None else ""
-                                print(f"\n--- Starting pre-filter maturation for {mpnn_design_name} (max {mat_max_rounds} rounds) ---")
-                                print(f"  Baseline: {mat_metric_name}={mat_best_metric:.4f}{ipsae_str}")
-                                mat_fixed_set = set()
-                                mat_rounds_completed = 0
-                                mat_converged = False
-                                mat_all_scan_mutations = []
-                                new_redesign = set()
-                                mat_averages = mpnn_complex_averages
-
-                                for mat_round in range(1, mat_max_rounds + 1):
-                                    # Step 0: Compute per-residue REU (primary quality metric)
-                                    mat_per_residue_reu, mat_pose, mat_scorefxn = compute_per_residue_reu(
-                                        mat_current_pdb, binder_chain=binder_chain,
-                                        use_pyrosetta=use_pyrosetta, return_pose=True)
-                                    if mat_per_residue_reu is not None:
-                                        vprint(f"  [Maturation] Per-residue REU computed for {len(mat_per_residue_reu)} residues")
-                                    else:
-                                        vprint(f"  [Maturation] REU unavailable, using pLDDT/PAE/contacts only")
-
-                                    residue_quality = assess_interface_residue_quality(
-                                        mat_current_pdb, mat_pae, mat_plddt,
-                                        mat_target_len, mat_binder_len,
-                                        advanced_settings, binder_chain=binder_chain,
-                                        per_residue_reu=mat_per_residue_reu)
-
-                                    if not residue_quality:
-                                        print(f"  Maturation round {mat_round}: no interface residues found, stopping")
-                                        break
-
-                                    new_fixed, new_redesign, mat_converged = partition_interface_residues(
-                                        residue_quality, mat_fixed_set, advanced_settings)
-                                    mat_fixed_set = new_fixed
-
-                                    if mat_converged:
-                                        print(f"  Maturation converged at round {mat_round} — all interface residues are high quality")
-                                        break
-
-                                    if mat_fixed_set and use_pyrosetta:
-                                        scan_output = os.path.join(design_paths["MPNN/Maturation"],
-                                                                   f"{mpnn_design_name}_mat{mat_round}_scanned.pdb")
-                                        scan_seq, scan_mutations = scan_fixed_residues(
-                                            mat_current_pdb, mat_fixed_set, binder_chain,
-                                            advanced_settings, scan_output,
-                                            preloaded_pose=mat_pose,
-                                            preloaded_scorefxn=mat_scorefxn)
-                                        if scan_mutations:
-                                            mat_current_pdb = scan_output
-                                            mat_current_seq = scan_seq
-                                            mat_all_scan_mutations.extend(scan_mutations)
-                                            mut_str = ', '.join(f"{old}{idx+1}{new}" for idx, old, new, _, _ in scan_mutations)
-                                            print(f"  [Scan] {len(scan_mutations)} mutations accepted: {mut_str}")
-
-                                    mat_design_name = f"{mpnn_design_name}_mat{mat_round}"
-                                    try:
-                                        mat_af_model, mat_traj_pdb = binder_maturation_hallucination(
-                                            mat_design_name, target_settings["starting_pdb"],
-                                            target_settings["chains"], target_settings.get("target_hotspot_residues", ""),
-                                            length, mat_current_seq, list(mat_fixed_set), seed,
-                                            helicity_value, design_models, advanced_settings,
-                                            design_paths, failure_csv)
-                                    except Exception as e:
-                                        print(f"  Maturation hallucination failed at round {mat_round}: {e}")
-                                        break
-
-                                    mat_traj_contacts = hotspot_residues(mat_traj_pdb, binder_chain)
-                                    mat_traj_interface_str = ','.join(f"{binder_chain}{res}" for res in mat_traj_contacts.keys())
-
-                                    mat_fix_str = format_fixed_positions_for_mpnn(mat_fixed_set, binder_chain)
-                                    try:
-                                        mat_mpnn_seqs = mpnn_gen_sequence_maturation(
-                                            mat_traj_pdb, binder_chain, mat_fix_str, advanced_settings)
-                                    except Exception as e:
-                                        print(f"  Maturation MPNN failed at round {mat_round}: {e}")
-                                        break
-
-                                    if not mat_mpnn_seqs or not mat_mpnn_seqs.get('seq'):
-                                        print(f"  No MPNN sequences generated at round {mat_round}, stopping")
-                                        break
-
-                                    mat_seq_list = [
-                                        {'seq': mat_mpnn_seqs['seq'][n][-length:],
-                                         'score': mat_mpnn_seqs['score'][n]}
-                                        for n in range(len(mat_mpnn_seqs['seq']))
-                                    ]
-                                    mat_best_seq = min(mat_seq_list, key=lambda x: x['score'])
-                                    mat_mpnn_name = f"{mat_design_name}_mpnn1"
-                                    mat_pred_stats, mat_pass_af2, _ = predict_binder_complex(
-                                        complex_prediction_model, mat_best_seq['seq'], mat_mpnn_name,
-                                        target_settings["starting_pdb"], target_settings["chains"],
-                                        length, mat_traj_pdb, prediction_models, advanced_settings,
-                                        filters, design_paths, failure_csv, use_pyrosetta=use_pyrosetta)
-
-                                    if not mat_pass_af2:
-                                        print(f"  Maturation round {mat_round}: AF2 prediction failed, stopping")
-                                        break
-
-                                    for mat_model_num in prediction_models:
-                                        mat_mpnn_pdb = os.path.join(design_paths["MPNN"], f"{mat_mpnn_name}_model{mat_model_num+1}.pdb")
-                                        mat_relaxed_pdb = os.path.join(design_paths["MPNN/Maturation"], f"{mat_mpnn_name}_model{mat_model_num+1}.pdb")
-                                        if os.path.exists(mat_mpnn_pdb):
-                                            try:
-                                                pr_relax(mat_mpnn_pdb, mat_relaxed_pdb, use_pyrosetta=use_pyrosetta)
-                                            except Exception as e:
-                                                print(f"  Maturation relax failed for model {mat_model_num+1}: {e}")
-                                                shutil.copy(mat_mpnn_pdb, mat_relaxed_pdb)
-
-                                    mat_averages = calculate_averages(mat_pred_stats, handle_aa=False)
-                                    mat_new_metric = get_maturation_metric(mat_averages, mat_metric_name)
-
-                                    mat_new_ipsae = mat_averages.get('ipSAE', None)
-                                    log_maturation_round(mat_round, mat_fixed_set, new_redesign,
-                                                         residue_quality, mat_metric_name,
-                                                         mat_best_metric, mat_new_metric,
-                                                         ipsae=mat_new_ipsae)
-
-                                    metric_improved = mat_new_metric > mat_best_metric + mat_improvement_thresh
-                                    if mat_new_ipsae is not None and mat_best_ipsae is not None:
-                                        ipsae_improved = mat_new_ipsae > mat_best_ipsae + mat_ipsae_thresh
-                                    else:
-                                        ipsae_improved = True
-
-                                    if metric_improved and ipsae_improved:
-                                        mat_best_metric = mat_new_metric
-                                        mat_best_ipsae = mat_new_ipsae
-                                        mat_current_seq = mat_best_seq['seq']
-                                        mat_model_plddt = {m: mat_pred_stats[m].get('pLDDT', 0) for m in mat_pred_stats if not str(m).startswith('_')}
-                                        mat_best_model_num = max(mat_model_plddt, key=mat_model_plddt.get) if mat_model_plddt else best_model_number
-                                        mat_best_model_stats = mat_pred_stats.get(mat_best_model_num, {})
-                                        if mat_best_model_stats.get('_pae_matrix') is not None:
-                                            mat_pae = mat_best_model_stats['_pae_matrix']
-                                            mat_plddt = mat_best_model_stats['_plddt_array']
-                                        mat_relaxed_best = os.path.join(design_paths["MPNN/Maturation"],
-                                                                         f"{mat_mpnn_name}_model{mat_best_model_num}.pdb")
-                                        if os.path.exists(mat_relaxed_best):
-                                            mat_current_pdb = mat_relaxed_best
-                                            best_model_pdb = mat_relaxed_best
-                                        mat_rounds_completed = mat_round
-                                    else:
-                                        reasons = []
-                                        if not metric_improved:
-                                            reasons.append(f"{mat_metric_name} {mat_new_metric - mat_best_metric:+.4f} < {mat_improvement_thresh}")
-                                        if not ipsae_improved:
-                                            delta = (mat_new_ipsae or 0) - (mat_best_ipsae or 0)
-                                            reasons.append(f"ipSAE {delta:+.4f} < {mat_ipsae_thresh}")
-                                        print(f"  No improvement at round {mat_round} ({'; '.join(reasons)}), stopping maturation")
-                                        mat_rounds_completed = mat_round
-                                        break
-
-                                # Update maturation columns in mpnn_data
-                                mat_post_iptm = mpnn_complex_averages.get('i_pTM', None) if mat_rounds_completed == 0 else mat_averages.get('i_pTM', None)
-                                mat_post_ipsae = mpnn_complex_averages.get('ipSAE', None) if mat_rounds_completed == 0 else mat_averages.get('ipSAE', None)
-                                fixed_res_str = ','.join(str(i) for i in sorted(mat_fixed_set))
-                                redesign_res_str = ','.join(str(i) for i in sorted(new_redesign)) if not mat_converged else ''
-
-                                mat_col_start = len(mpnn_data) - 14
-                                mpnn_data[mat_col_start] = mat_rounds_completed
-                                mpnn_data[mat_col_start + 1] = mat_converged
-                                mpnn_data[mat_col_start + 2] = fixed_res_str
-                                mpnn_data[mat_col_start + 3] = redesign_res_str
-                                mpnn_data[mat_col_start + 4] = mat_pre_metric_iptm
-                                mpnn_data[mat_col_start + 5] = mat_post_iptm
-                                mpnn_data[mat_col_start + 6] = mat_pre_metric_ipsae
-                                mpnn_data[mat_col_start + 7] = mat_post_ipsae
-                                scan_mut_str = ' '.join(
-                                    f"{old}{idx+1}{new}({new_reu-old_reu:.1f})"
-                                    for idx, old, new, old_reu, new_reu in mat_all_scan_mutations
-                                ) if mat_all_scan_mutations else ''
-                                mpnn_data[mat_col_start + 8] = scan_mut_str
-
-                                if mat_rounds_completed > 0:
-                                    mpnn_data[6] = mat_current_seq
-                                    ipsae_summary = f", ipSAE {mat_pre_metric_ipsae:.4f} -> {mat_post_ipsae:.4f}" if mat_pre_metric_ipsae is not None and mat_post_ipsae is not None else ""
-                                    iptm_summary = f"{mat_pre_metric_iptm:.4f} -> {mat_post_iptm:.4f}" if mat_pre_metric_iptm is not None and mat_post_iptm is not None else "N/A"
-                                    print(f"--- Pre-filter maturation complete: {mat_rounds_completed} rounds, "
-                                          f"{mat_metric_name} {iptm_summary}{ipsae_summary} ---\n")
-
-                                # Update CSV with maturation data before filter check
-                                update_last_csv_row(mpnn_csv, mpnn_data)
-                            else:
-                                vprint("[Maturation] Skipped: no cached PAE/pLDDT data available")
-
-                        # Run filter check — on matured stats if pre-filter maturation ran, else on original stats
-                        filter_conditions = check_filters(mpnn_data, design_labels, filters)
-                        if filter_conditions is True:
-                            print(mpnn_design_name+" passed all filters")
-                            accepted_mpnn += 1
-                            accepted_designs += 1
-
-                            ############################################
-                            ### Post-filter Maturation (default mode: maturation_pre_filters=False)
-                            ############################################
-                            if mat_enabled and not mat_pre_filters:
-
-                                mat_max_rounds = advanced_settings.get("maturation_max_rounds", 3)
-                                mat_metric_name = advanced_settings.get("maturation_improvement_metric", "i_pTM")
-                                mat_improvement_thresh = advanced_settings.get("maturation_improvement_threshold", 0.01)
-                                mat_ipsae_thresh = advanced_settings.get("maturation_ipsae_improvement_threshold", 0.01)
-
-                                # Get cached PAE/pLDDT from the best model's prediction
-                                best_pred_stats = mpnn_complex_statistics.get(best_model_number, {})
-                                mat_pae = best_pred_stats.get('_pae_matrix')
-                                mat_plddt = best_pred_stats.get('_plddt_array')
-                                mat_target_len = best_pred_stats.get('_target_len')
-                                mat_binder_len = best_pred_stats.get('_binder_len')
-
-                                if mat_pae is not None and mat_plddt is not None:
-                                    mat_ran = True
-                                    mat_current_pdb = best_model_pdb
-                                    mat_current_seq = mpnn_sequence['seq']
-                                    mat_best_metric = get_maturation_metric(mpnn_complex_averages, mat_metric_name)
-                                    mat_best_ipsae = mpnn_complex_averages.get('ipSAE', None)
-                                    mat_pre_metric_iptm = mpnn_complex_averages.get('i_pTM', None)
-                                    mat_pre_metric_ipsae = mat_best_ipsae
-                                    ipsae_str = f", ipSAE: {mat_pre_metric_ipsae:.4f}" if mat_pre_metric_ipsae is not None else ""
-                                    print(f"\n--- Starting maturation for {mpnn_design_name} (max {mat_max_rounds} rounds) ---")
-                                    print(f"  Baseline: {mat_metric_name}={mat_best_metric:.4f}{ipsae_str}")
-                                    mat_fixed_set = set()
-                                    mat_rounds_completed = 0
-                                    mat_converged = False
-                                    mat_all_scan_mutations = []
-                                    new_redesign = set()
-                                    mat_averages = mpnn_complex_averages
-
-                                    for mat_round in range(1, mat_max_rounds + 1):
-                                        # Step 0: Compute per-residue REU (primary quality metric)
-                                        mat_per_residue_reu, mat_pose, mat_scorefxn = compute_per_residue_reu(
-                                            mat_current_pdb, binder_chain=binder_chain,
-                                            use_pyrosetta=use_pyrosetta, return_pose=True)
-                                        if mat_per_residue_reu is not None:
-                                            vprint(f"  [Maturation] Per-residue REU computed for {len(mat_per_residue_reu)} residues")
-                                        else:
-                                            vprint(f"  [Maturation] REU unavailable, using pLDDT/PAE/contacts only")
-
-                                        residue_quality = assess_interface_residue_quality(
-                                            mat_current_pdb, mat_pae, mat_plddt,
-                                            mat_target_len, mat_binder_len,
-                                            advanced_settings, binder_chain=binder_chain,
-                                            per_residue_reu=mat_per_residue_reu)
-
-                                        if not residue_quality:
-                                            print(f"  Maturation round {mat_round}: no interface residues found, stopping")
-                                            break
-
-                                        new_fixed, new_redesign, mat_converged = partition_interface_residues(
-                                            residue_quality, mat_fixed_set, advanced_settings)
-                                        mat_fixed_set = new_fixed
-
-                                        if mat_converged:
-                                            print(f"  Maturation converged at round {mat_round} — all interface residues are high quality")
-                                            break
-
-                                        if mat_fixed_set and use_pyrosetta:
-                                            scan_output = os.path.join(design_paths["MPNN/Maturation"],
-                                                                       f"{mpnn_design_name}_mat{mat_round}_scanned.pdb")
-                                            scan_seq, scan_mutations = scan_fixed_residues(
-                                                mat_current_pdb, mat_fixed_set, binder_chain,
-                                                advanced_settings, scan_output,
-                                                preloaded_pose=mat_pose,
-                                                preloaded_scorefxn=mat_scorefxn)
-                                            if scan_mutations:
-                                                mat_current_pdb = scan_output
-                                                mat_current_seq = scan_seq
-                                                mat_all_scan_mutations.extend(scan_mutations)
-                                                mut_str = ', '.join(f"{old}{idx+1}{new}" for idx, old, new, _, _ in scan_mutations)
-                                                print(f"  [Scan] {len(scan_mutations)} mutations accepted: {mut_str}")
-
-                                        mat_design_name = f"{mpnn_design_name}_mat{mat_round}"
-                                        try:
-                                            mat_af_model, mat_traj_pdb = binder_maturation_hallucination(
-                                                mat_design_name, target_settings["starting_pdb"],
-                                                target_settings["chains"], target_settings.get("target_hotspot_residues", ""),
-                                                length, mat_current_seq, list(mat_fixed_set), seed,
-                                                helicity_value, design_models, advanced_settings,
-                                                design_paths, failure_csv)
-                                        except Exception as e:
-                                            print(f"  Maturation hallucination failed at round {mat_round}: {e}")
-                                            break
-
-                                        mat_traj_contacts = hotspot_residues(mat_traj_pdb, binder_chain)
-                                        mat_traj_interface_str = ','.join(f"{binder_chain}{res}" for res in mat_traj_contacts.keys())
-
-                                        mat_fix_str = format_fixed_positions_for_mpnn(mat_fixed_set, binder_chain)
-                                        try:
-                                            mat_mpnn_seqs = mpnn_gen_sequence_maturation(
-                                                mat_traj_pdb, binder_chain, mat_fix_str, advanced_settings)
-                                        except Exception as e:
-                                            print(f"  Maturation MPNN failed at round {mat_round}: {e}")
-                                            break
-
-                                        if not mat_mpnn_seqs or not mat_mpnn_seqs.get('seq'):
-                                            print(f"  No MPNN sequences generated at round {mat_round}, stopping")
-                                            break
-
-                                        mat_seq_list = [
-                                            {'seq': mat_mpnn_seqs['seq'][n][-length:],
-                                             'score': mat_mpnn_seqs['score'][n]}
-                                            for n in range(len(mat_mpnn_seqs['seq']))
-                                        ]
-                                        mat_best_seq = min(mat_seq_list, key=lambda x: x['score'])
-                                        mat_mpnn_name = f"{mat_design_name}_mpnn1"
-                                        mat_pred_stats, mat_pass_af2, _ = predict_binder_complex(
-                                            complex_prediction_model, mat_best_seq['seq'], mat_mpnn_name,
-                                            target_settings["starting_pdb"], target_settings["chains"],
-                                            length, mat_traj_pdb, prediction_models, advanced_settings,
-                                            filters, design_paths, failure_csv, use_pyrosetta=use_pyrosetta)
-
-                                        if not mat_pass_af2:
-                                            print(f"  Maturation round {mat_round}: AF2 filters not passed, stopping")
-                                            break
-
-                                        for mat_model_num in prediction_models:
-                                            mat_mpnn_pdb = os.path.join(design_paths["MPNN"], f"{mat_mpnn_name}_model{mat_model_num+1}.pdb")
-                                            mat_relaxed_pdb = os.path.join(design_paths["MPNN/Maturation"], f"{mat_mpnn_name}_model{mat_model_num+1}.pdb")
-                                            if os.path.exists(mat_mpnn_pdb):
-                                                try:
-                                                    pr_relax(mat_mpnn_pdb, mat_relaxed_pdb, use_pyrosetta=use_pyrosetta)
-                                                except Exception as e:
-                                                    print(f"  Maturation relax failed for model {mat_model_num+1}: {e}")
-                                                    shutil.copy(mat_mpnn_pdb, mat_relaxed_pdb)
-
-                                        mat_averages = calculate_averages(mat_pred_stats, handle_aa=False)
-                                        mat_new_metric = get_maturation_metric(mat_averages, mat_metric_name)
-
-                                        mat_new_ipsae = mat_averages.get('ipSAE', None)
-                                        log_maturation_round(mat_round, mat_fixed_set, new_redesign,
-                                                             residue_quality, mat_metric_name,
-                                                             mat_best_metric, mat_new_metric,
-                                                             ipsae=mat_new_ipsae)
-
-                                        metric_improved = mat_new_metric > mat_best_metric + mat_improvement_thresh
-                                        if mat_new_ipsae is not None and mat_best_ipsae is not None:
-                                            ipsae_improved = mat_new_ipsae > mat_best_ipsae + mat_ipsae_thresh
-                                        else:
-                                            ipsae_improved = True
-
-                                        if metric_improved and ipsae_improved:
-                                            mat_best_metric = mat_new_metric
-                                            mat_best_ipsae = mat_new_ipsae
-                                            mat_current_seq = mat_best_seq['seq']
-                                            mat_model_plddt = {m: mat_pred_stats[m].get('pLDDT', 0) for m in mat_pred_stats if not str(m).startswith('_')}
-                                            mat_best_model_num = max(mat_model_plddt, key=mat_model_plddt.get) if mat_model_plddt else best_model_number
-                                            mat_best_model_stats = mat_pred_stats.get(mat_best_model_num, {})
-                                            if mat_best_model_stats.get('_pae_matrix') is not None:
-                                                mat_pae = mat_best_model_stats['_pae_matrix']
-                                                mat_plddt = mat_best_model_stats['_plddt_array']
-                                            mat_relaxed_best = os.path.join(design_paths["MPNN/Maturation"],
-                                                                             f"{mat_mpnn_name}_model{mat_best_model_num}.pdb")
-                                            if os.path.exists(mat_relaxed_best):
-                                                mat_current_pdb = mat_relaxed_best
-                                                best_model_pdb = mat_relaxed_best
-                                            mat_rounds_completed = mat_round
-                                        else:
-                                            reasons = []
-                                            if not metric_improved:
-                                                reasons.append(f"{mat_metric_name} {mat_new_metric - mat_best_metric:+.4f} < {mat_improvement_thresh}")
-                                            if not ipsae_improved:
-                                                delta = (mat_new_ipsae or 0) - (mat_best_ipsae or 0)
-                                                reasons.append(f"ipSAE {delta:+.4f} < {mat_ipsae_thresh}")
-                                            print(f"  No improvement at round {mat_round} ({'; '.join(reasons)}), stopping maturation")
-                                            mat_rounds_completed = mat_round
-                                            break
-
-                                    # Update maturation columns in mpnn_data
-                                    mat_post_iptm = mpnn_complex_averages.get('i_pTM', None) if mat_rounds_completed == 0 else mat_averages.get('i_pTM', None)
-                                    mat_post_ipsae = mpnn_complex_averages.get('ipSAE', None) if mat_rounds_completed == 0 else mat_averages.get('ipSAE', None)
-                                    fixed_res_str = ','.join(str(i) for i in sorted(mat_fixed_set))
-                                    redesign_res_str = ','.join(str(i) for i in sorted(new_redesign)) if not mat_converged else ''
-
-                                    mat_col_start = len(mpnn_data) - 14
-                                    mpnn_data[mat_col_start] = mat_rounds_completed
-                                    mpnn_data[mat_col_start + 1] = mat_converged
-                                    mpnn_data[mat_col_start + 2] = fixed_res_str
-                                    mpnn_data[mat_col_start + 3] = redesign_res_str
-                                    mpnn_data[mat_col_start + 4] = mat_pre_metric_iptm
-                                    mpnn_data[mat_col_start + 5] = mat_post_iptm
-                                    mpnn_data[mat_col_start + 6] = mat_pre_metric_ipsae
-                                    mpnn_data[mat_col_start + 7] = mat_post_ipsae
-                                    scan_mut_str = ' '.join(
-                                        f"{old}{idx+1}{new}({new_reu-old_reu:.1f})"
-                                        for idx, old, new, old_reu, new_reu in mat_all_scan_mutations
-                                    ) if mat_all_scan_mutations else ''
-                                    mpnn_data[mat_col_start + 8] = scan_mut_str
-
-                                    if mat_rounds_completed > 0:
-                                        mpnn_data[6] = mat_current_seq
-                                        ipsae_summary = f", ipSAE {mat_pre_metric_ipsae:.4f} -> {mat_post_ipsae:.4f}" if mat_pre_metric_ipsae is not None and mat_post_ipsae is not None else ""
-                                        iptm_summary = f"{mat_pre_metric_iptm:.4f} -> {mat_post_iptm:.4f}" if mat_pre_metric_iptm is not None and mat_post_iptm is not None else "N/A"
-                                        print(f"--- Maturation complete: {mat_rounds_completed} rounds, "
-                                              f"{mat_metric_name} {iptm_summary}{ipsae_summary} ---\n")
-                                else:
-                                    vprint("[Maturation] Skipped: no cached PAE/pLDDT data available")
-                            ############################################
-                            ### End Maturation
-                            ############################################
-
-                            # Update mpnn_csv with maturation data (last row was written pre-maturation with None placeholders)
-                            if mat_ran:
-                                update_last_csv_row(mpnn_csv, mpnn_data)
-
-                            # copy designs to accepted folder
-                            shutil.copy(best_model_pdb, design_paths["Accepted"])
-
-                            # insert data into final csv
-                            final_data = [''] + mpnn_data
-                            insert_data(final_csv, final_data)
-
-                            # copy animation from accepted trajectory
-                            if advanced_settings["save_design_animations"]:
-                                accepted_animation = os.path.join(design_paths["Accepted/Animation"], f"{design_name}.html")
-                                if not os.path.exists(accepted_animation):
-                                    shutil.copy(os.path.join(design_paths["Trajectory/Animation"], f"{design_name}.html"), accepted_animation)
-
-                            # copy plots of accepted trajectory
-                            plot_files = os.listdir(design_paths["Trajectory/Plots"])
-                            plots_to_copy = [f for f in plot_files if f.startswith(design_name) and f.endswith('.png')]
-                            for accepted_plot in plots_to_copy:
-                                source_plot = os.path.join(design_paths["Trajectory/Plots"], accepted_plot)
-                                target_plot = os.path.join(design_paths["Accepted/Plots"], accepted_plot)
-                                if not os.path.exists(target_plot):
-                                    shutil.copy(source_plot, target_plot)
-
-                        else:
-                            print(f"Unmet filter conditions for {mpnn_design_name}")
-                            failure_df = pd.read_csv(failure_csv)
-                            special_prefixes = ('Average_', '1_', '2_', '3_', '4_', '5_')
-                            incremented_columns = set()
-
-                            for column in filter_conditions:
-                                base_column = column
-                                for prefix in special_prefixes:
-                                    if column.startswith(prefix):
-                                        base_column = column.split('_', 1)[1]
-                                        break # Corrected: was missing break
-
-                                if base_column not in incremented_columns:
-                                    if base_column in failure_df.columns: # Check if column exists before incrementing
-                                        failure_df[base_column] = failure_df[base_column] + 1
-                                    else:
-                                        # This case should ideally not happen if generate_filter_pass_csv creates all potential base_columns
-                                        print(f"Warning: Base column '{base_column}' not found in {failure_csv}. It won't be incremented for this failure.")
-                                    incremented_columns.add(base_column)
-
-                            failure_df.to_csv(failure_csv, index=False)
-
-                            # Log to rejected_mpnn_full_stats.csv
-                            rejected_data_list_for_csv = [mpnn_design_name, mpnn_sequence['seq']]
-                            for filter_col_name in filter_column_names_for_rejected_log:
-                                if filter_col_name in incremented_columns:
-                                    rejected_data_list_for_csv.append(1)
-                                else:
-                                    rejected_data_list_for_csv.append(0)
-                            insert_data(rejected_mpnn_full_stats_csv, rejected_data_list_for_csv)
-
-                            shutil.copy(best_model_pdb, design_paths["Rejected"])
-                        
                         # increase MPNN design number
                         mpnn_n += 1
-                        
+
                         # Force garbage collection after each MPNN design to prevent file descriptor accumulation
                         gc.collect()
 
-                        # if enough mpnn sequences of the same trajectory pass filters then stop
-                        if accepted_mpnn >= advanced_settings["max_mpnn_sequences"]:
-                            break
+                    ############################################
+                    ### Phase 2: Select best maturation candidate
+                    ############################################
+                    mat_enabled = advanced_settings.get("enable_maturation", False)
+                    mat_pre_filters = advanced_settings.get("maturation_pre_filters", False)
+                    mat_revert_on_worse = advanced_settings.get("maturation_revert_on_worse", True)
+                    best_mat_candidate = None
+
+                    if mat_enabled and maturation_candidates:
+                        # Sort by ipSAE descending
+                        ranked = sorted(maturation_candidates, key=lambda c: c['ipSAE'], reverse=True)
+
+                        # Count HQ residues for each candidate (no REU for ranking)
+                        best_n_hq = 0
+                        for candidate in ranked:
+                            stats = candidate['complex_statistics'].get(candidate['best_model_number'], {})
+                            n_hq = count_high_quality_residues(
+                                candidate['best_model_pdb'],
+                                stats.get('_pae_matrix'), stats.get('_plddt_array'),
+                                stats.get('_target_len'), stats.get('_binder_len'),
+                                advanced_settings, binder_chain=binder_chain)
+                            candidate['n_hq'] = n_hq
+                            if n_hq > best_n_hq:
+                                best_n_hq = n_hq
+                                best_mat_candidate = candidate
+
+                        if best_mat_candidate:
+                            print(f"\n[Maturation Selection] {best_mat_candidate['design_name']} selected "
+                                  f"(ipSAE={best_mat_candidate['ipSAE']:.4f}, {best_n_hq} HQ residues)")
+                        else:
+                            print(f"\n[Maturation Selection] No candidates with high-quality interface residues, skipping maturation")
+
+                    ############################################
+                    ### Phase 3: Process designs
+                    ############################################
+                    if best_mat_candidate is not None:
+                        # Maturation candidate found — process only that candidate
+                        cand = best_mat_candidate
+                        cand_mpnn_data = cand['mpnn_data']
+                        cand_design_name = cand['design_name']
+                        cand_best_model_pdb = cand['best_model_pdb']
+                        cand_pre_mat_pdb = cand['best_model_pdb']  # Save for revert
+                        cand_pre_mat_data = list(cand_mpnn_data)  # Save copy for revert
+
+                        # Build context dict for maturation
+                        ctx = {
+                            'complex_prediction_model': complex_prediction_model,
+                            'design_models': design_models,
+                            'prediction_models': prediction_models,
+                            'target_settings': target_settings,
+                            'length': length,
+                            'seed': seed,
+                            'helicity_value': helicity_value,
+                            'binder_chain': binder_chain,
+                            'design_paths': design_paths,
+                            'failure_csv': failure_csv,
+                            'mpnn_csv': mpnn_csv,
+                            'use_pyrosetta': use_pyrosetta,
+                            'filters': filters,
+                        }
+
+                        if mat_pre_filters:
+                            ############################################
+                            ### Pre-filter maturation: mature first, then filter check
+                            ############################################
+                            mat_ran, cand_mpnn_data, cand_best_model_pdb = _run_maturation(
+                                cand, ctx, advanced_settings, mat_label="pre-filter")
+
+                            # Revert if maturation worsened metrics
+                            _, cand_mpnn_data, cand_best_model_pdb, mat_ran = _check_maturation_revert(
+                                mat_ran, mat_revert_on_worse, cand_mpnn_data,
+                                cand_pre_mat_data, cand_pre_mat_pdb, cand_best_model_pdb)
+
+                            # Filter check on matured (or reverted) design
+                            filter_conditions = check_filters(cand_mpnn_data, design_labels, filters)
+                            if filter_conditions is True:
+                                final_name = cand_design_name + ("_matured" if mat_ran else "")
+                                if mat_ran:
+                                    cand_mpnn_data[0] = final_name
+                                print(final_name + " passed all filters")
+                                accepted_mpnn += 1
+                                accepted_designs += 1
+
+                                if mat_ran:
+                                    update_last_csv_row(mpnn_csv, cand_mpnn_data)
+
+                                _accept_design(cand_best_model_pdb, cand_mpnn_data, design_name,
+                                               design_paths, final_csv, advanced_settings)
+                            else:
+                                _reject_design(cand_design_name, cand_best_model_pdb, cand_mpnn_data,
+                                               filter_conditions, failure_csv, design_paths,
+                                               filter_column_names_for_rejected_log,
+                                               rejected_mpnn_full_stats_csv, cand['sequence'])
+
+                        else:
+                            ############################################
+                            ### Post-filter maturation: filter check first, then mature
+                            ############################################
+                            filter_conditions = check_filters(cand_mpnn_data, design_labels, filters)
+                            if filter_conditions is True:
+                                print(cand_design_name + " passed all filters")
+                                accepted_mpnn += 1
+                                accepted_designs += 1
+
+                                mat_ran, cand_mpnn_data, cand_best_model_pdb = _run_maturation(
+                                    cand, ctx, advanced_settings, mat_label="post-filter")
+
+                                # Revert if maturation worsened metrics
+                                _, cand_mpnn_data, cand_best_model_pdb, mat_ran = _check_maturation_revert(
+                                    mat_ran, mat_revert_on_worse, cand_mpnn_data,
+                                    cand_pre_mat_data, cand_pre_mat_pdb, cand_best_model_pdb)
+
+                                final_name = cand_design_name + ("_matured" if mat_ran else "")
+                                if mat_ran:
+                                    cand_mpnn_data[0] = final_name
+                                    update_last_csv_row(mpnn_csv, cand_mpnn_data)
+
+                                _accept_design(cand_best_model_pdb, cand_mpnn_data, design_name,
+                                               design_paths, final_csv, advanced_settings)
+                            else:
+                                _reject_design(cand_design_name, cand_best_model_pdb, cand_mpnn_data,
+                                               filter_conditions, failure_csv, design_paths,
+                                               filter_column_names_for_rejected_log,
+                                               rejected_mpnn_full_stats_csv, cand['sequence'])
+
+                    else:
+                        # No maturation candidate — process ALL candidates through normal filter checking
+                        for cand in maturation_candidates:
+                            cand_mpnn_data = cand['mpnn_data']
+                            cand_design_name = cand['design_name']
+                            cand_best_model_pdb = cand['best_model_pdb']
+
+                            filter_conditions = check_filters(cand_mpnn_data, design_labels, filters)
+                            if filter_conditions is True:
+                                print(cand_design_name + " passed all filters")
+                                accepted_mpnn += 1
+                                accepted_designs += 1
+
+                                _accept_design(cand_best_model_pdb, cand_mpnn_data, design_name,
+                                               design_paths, final_csv, advanced_settings)
+                            else:
+                                _reject_design(cand_design_name, cand_best_model_pdb, cand_mpnn_data,
+                                               filter_conditions, failure_csv, design_paths,
+                                               filter_column_names_for_rejected_log,
+                                               rejected_mpnn_full_stats_csv, cand['sequence'])
+
+                            if accepted_mpnn >= advanced_settings["max_mpnn_sequences"]:
+                                break
 
                     if accepted_mpnn >= 1:
                         print("Found "+str(accepted_mpnn)+" MPNN designs passing filters")

@@ -15,6 +15,32 @@ import numpy as np
 import time
 from .logging_utils import vprint
 
+# Maturation CSV column definitions
+MATURATION_COLUMN_NAMES = [
+    'Maturation_Rounds', 'Maturation_Converged', 'Maturation_Fixed_Residues', 'Maturation_Redesigned_Residues',
+    'Pre_Maturation_i_pTM', 'Post_Maturation_i_pTM', 'Pre_Maturation_ipSAE', 'Post_Maturation_ipSAE',
+    'Maturation_Scan_Mutations']
+TRAILING_COLUMN_NAMES = ['DesignTime', 'Notes', 'TargetSettings', 'Filters', 'AdvancedSettings']
+
+# Maturation column offsets (relative to mat_col_start)
+MAT_ROUNDS = 0
+MAT_CONVERGED = 1
+MAT_FIXED_RES = 2
+MAT_REDESIGN_RES = 3
+MAT_PRE_IPTM = 4
+MAT_POST_IPTM = 5
+MAT_PRE_IPSAE = 6
+MAT_POST_IPSAE = 7
+MAT_SCAN_MUTATIONS = 8
+
+NUM_MATURATION_COLUMNS = len(MATURATION_COLUMN_NAMES)
+NUM_TRAILING_COLUMNS = len(TRAILING_COLUMN_NAMES)
+
+def maturation_col_start(mpnn_data):
+    """Return the starting index of maturation columns in an mpnn_data row."""
+    return len(mpnn_data) - NUM_MATURATION_COLUMNS - NUM_TRAILING_COLUMNS
+
+
 # Define labels for dataframes
 def generate_dataframe_labels():
     # labels for trajectory
@@ -35,11 +61,9 @@ def generate_dataframe_labels():
         design_labels += ['Average_' + label] + [f'{i}_{label}' for i in range(1, 6)]
 
     # maturation tracking columns (appended before time/settings)
-    design_labels += ['Maturation_Rounds', 'Maturation_Converged', 'Maturation_Fixed_Residues', 'Maturation_Redesigned_Residues',
-                      'Pre_Maturation_i_pTM', 'Post_Maturation_i_pTM', 'Pre_Maturation_ipSAE', 'Post_Maturation_ipSAE',
-                      'Maturation_Scan_Mutations']
+    design_labels += MATURATION_COLUMN_NAMES
 
-    design_labels += ['DesignTime', 'Notes', 'TargetSettings', 'Filters', 'AdvancedSettings']
+    design_labels += TRAILING_COLUMN_NAMES
 
     final_labels = ['Rank'] + design_labels
 
