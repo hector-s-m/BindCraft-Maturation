@@ -602,24 +602,15 @@ def _run_maturation(cand, ctx, advanced_settings, mat_label="maturation"):
 
         mat_traj_contacts = hotspot_residues(mat_traj_pdb, binder_chain)
 
-        # Re-prep prediction model — hallucination may invalidate JAX arrays
-        try:
-            if advanced_settings["predict_initial_guess"] or advanced_settings["predict_bigbang"]:
-                complex_prediction_model.prep_inputs(pdb_filename=trajectory_pdb, chain='A', binder_chain='B', binder_len=length, use_binder_template=True, rm_target_seq=advanced_settings["rm_template_seq_predict"],
-                                                    rm_target_sc=advanced_settings["rm_template_sc_predict"], rm_template_ic=True)
-            else:
-                complex_prediction_model.prep_inputs(pdb_filename=target_settings["starting_pdb"], chain=target_settings["chains"], binder_len=length, rm_target_seq=advanced_settings["rm_template_seq_predict"],
-                                                    rm_target_sc=advanced_settings["rm_template_sc_predict"])
-        except Exception as e:
-            print(f"  Re-prepping prediction model failed: {e}, recreating model")
-            complex_prediction_model = mk_afdesign_model(protocol="binder", num_recycles=advanced_settings["num_recycles_validation"], data_dir=advanced_settings["af_params_dir"],
-                                                          use_multimer=multimer_validation, use_initial_guess=advanced_settings["predict_initial_guess"], use_initial_atom_pos=advanced_settings["predict_bigbang"])
-            if advanced_settings["predict_initial_guess"] or advanced_settings["predict_bigbang"]:
-                complex_prediction_model.prep_inputs(pdb_filename=trajectory_pdb, chain='A', binder_chain='B', binder_len=length, use_binder_template=True, rm_target_seq=advanced_settings["rm_template_seq_predict"],
-                                                    rm_target_sc=advanced_settings["rm_template_sc_predict"], rm_template_ic=True)
-            else:
-                complex_prediction_model.prep_inputs(pdb_filename=target_settings["starting_pdb"], chain=target_settings["chains"], binder_len=length, rm_target_seq=advanced_settings["rm_template_seq_predict"],
-                                                    rm_target_sc=advanced_settings["rm_template_sc_predict"])
+        # Recreate prediction model — hallucination invalidates JAX PRNG key (prep_inputs alone doesn't reset it)
+        complex_prediction_model = mk_afdesign_model(protocol="binder", num_recycles=advanced_settings["num_recycles_validation"], data_dir=advanced_settings["af_params_dir"],
+                                                      use_multimer=multimer_validation, use_initial_guess=advanced_settings["predict_initial_guess"], use_initial_atom_pos=advanced_settings["predict_bigbang"])
+        if advanced_settings["predict_initial_guess"] or advanced_settings["predict_bigbang"]:
+            complex_prediction_model.prep_inputs(pdb_filename=trajectory_pdb, chain='A', binder_chain='B', binder_len=length, use_binder_template=True, rm_target_seq=advanced_settings["rm_template_seq_predict"],
+                                                rm_target_sc=advanced_settings["rm_template_sc_predict"], rm_template_ic=True)
+        else:
+            complex_prediction_model.prep_inputs(pdb_filename=target_settings["starting_pdb"], chain=target_settings["chains"], binder_len=length, rm_target_seq=advanced_settings["rm_template_seq_predict"],
+                                                rm_target_sc=advanced_settings["rm_template_sc_predict"])
 
         mat_fix_str = format_fixed_positions_for_mpnn(mat_fixed_set, binder_chain)
         try:
