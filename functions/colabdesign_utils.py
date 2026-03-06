@@ -461,9 +461,12 @@ def binder_maturation_hallucination(design_name, starting_pdb, chain, target_hot
     Starts from an existing sequence and refines non-fixed positions.
 
     Structural bias is achieved through fix_pos (freezing optimized residues)
-    and set_seq (starting from the current best sequence). Template-based
-    approaches (use_initial_guess, use_binder_template) are NOT compatible
-    with ColabDesign's design methods (design_soft/design_hard/design_pssm_semigreedy).
+    and set_seq (starting from the current best sequence).
+
+    In binder hallucination mode, ColabDesign does not set _wt_aatype
+    (the wild-type amino acid array). But _fix_pos() and _mutate() require
+    it when fix_pos is set. We manually set _wt_aatype from the current
+    sequence to make fix_pos work in hallucination mode.
 
     Args:
         current_sequence: str, the current best binder sequence
@@ -493,8 +496,17 @@ def binder_maturation_hallucination(design_name, starting_pdb, chain, target_hot
     # Set current best sequence as starting point
     af_model.set_seq(seq=current_sequence)
 
+    # Manually set _wt_aatype — required by _fix_pos() and _mutate() but
+    # never initialized in binder hallucination mode (no binder_chain in prep_inputs).
+    # Without this, any non-empty fix_pos causes AttributeError on _wt_aatype.
+    aa_order = "ARNDCQEGHILKMFPSTWYV"
+    seq_to_idx = {aa: i for i, aa in enumerate(aa_order)}
+    af_model._wt_aatype = np.array([seq_to_idx[aa] for aa in current_sequence])
+
     # Inject fix_pos constraint — ColabDesign's _mutate() enforces this
-    af_model.opt["fix_pos"] = list(fixed_positions)
+    # Only set when non-empty; even an empty list triggers _fix_pos() which needs _wt_aatype
+    if fixed_positions:
+        af_model.opt["fix_pos"] = list(fixed_positions)
 
     # Shortened design stages (refinement, not de novo)
     soft_iters = advanced_settings.get("maturation_soft_iterations", 20)
