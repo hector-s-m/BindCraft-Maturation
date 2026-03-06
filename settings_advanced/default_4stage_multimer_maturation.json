@@ -72,6 +72,7 @@
     "maturation_improvement_threshold": 0.01,
     "maturation_ipsae_improvement_threshold": 0.01,
     "maturation_revert_on_worse": true,
+    "min_trajectory_ipsae": 0.5,
     "_comment_maturation_thresholds": "Hard AND thresholds: residue must pass ALL to be fixed. REU <= -5.0, pLDDT >= 0.85, PAE <= 5.0",
     "maturation_require_defined_ss": false,
     "maturation_reu_threshold": -5.0,

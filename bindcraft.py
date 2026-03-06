@@ -857,6 +857,13 @@ while True:
         print("Starting trajectory took: "+trajectory_time_text)
         print("")
 
+        # Skip trajectory if ipSAE is too low (not worth relaxing and scoring)
+        min_traj_ipsae = advanced_settings.get("min_trajectory_ipsae", 0.5)
+        traj_ipsae_val = trajectory_metrics.get('ipSAE', None)
+        if traj_ipsae_val is not None and traj_ipsae_val < min_traj_ipsae:
+            print(f"Trajectory ipSAE ({traj_ipsae_val:.4f}) below threshold ({min_traj_ipsae}), skipping")
+            continue
+
         # Proceed if there is no trajectory termination signal
         if trajectory.aux["log"]["terminate"] == "":
             # Relax binder to calculate statistics
