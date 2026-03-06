@@ -680,6 +680,13 @@ def assess_interface_residue_quality(pdb_file, pae_matrix, plddt_array,
     ss_note = f", SS=helix/sheet [PRO exempt, {n_ss_fail} rejected for loop/coil SS]" if require_ss else ""
     vprint(f"[Maturation] {n_hq}/{len(quality_results)} interface residues pass all filters "
            f"(REU<={reu_thresh}, pLDDT>={plddt_thresh}, PAE<={pae_thresh}{ss_note})")
+    if n_hq > 0:
+        hq_details = []
+        for idx, v in quality_results.items():
+            if v['is_high_quality']:
+                reu_str = f"REU={v['reu']:.1f}" if v['reu'] is not None else "REU=N/A"
+                hq_details.append(f"{v['aa']}{idx+1}({reu_str}, pLDDT={v['plddt']:.2f}, PAE={v['mean_interface_pae']:.1f}, SS={v['ss']})")
+        vprint(f"[Maturation] HQ residues: {', '.join(hq_details)}")
 
     return quality_results
 
