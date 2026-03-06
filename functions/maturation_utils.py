@@ -66,11 +66,12 @@ def compute_per_residue_reu(pdb_file, binder_chain="B", use_pyrosetta=True,
 
 def _target_interaction_reu(pose, pose_resid, target_pose_resids, scorefxn):
     """
-    Compute REU for a residue considering only its internal (one-body) energy
-    and pairwise interactions with target chain residues.
+    Compute pairwise interaction REU between a binder residue and target chain residues.
 
-    Ignores interactions with binder scaffold residues, which will be redesigned
-    in subsequent maturation steps and could cause false negatives.
+    Uses only two-body terms (fa_atr, fa_rep, fa_elec, hbond, fa_sol, etc.) from the
+    EnergyGraph. One-body terms (ref, rama, p_aa_pp) are excluded because they reflect
+    intrinsic residue preferences rather than actual target contacts, and can cause the
+    scan to pick mutations (e.g. Y->P) based on reference energy alone.
 
     Args:
         pose: Scored PyRosetta Pose
@@ -79,14 +80,10 @@ def _target_interaction_reu(pose, pose_resid, target_pose_resids, scorefxn):
         scorefxn: Rosetta ScoreFunction (for weight vector)
 
     Returns:
-        float: one-body + target two-body REU
+        float: target two-body interaction REU
     """
     weights = scorefxn.weights()
 
-    # One-body: internal energy (Ramachandran, rotamer probability, reference)
-    onebody = pose.energies().onebody_energies(pose_resid).dot(weights)
-
-    # Two-body: only interactions with target residues
     energy_graph = pose.energies().energy_graph()
     twobody = 0.0
     for t_resid in target_pose_resids:
@@ -94,7 +91,7 @@ def _target_interaction_reu(pose, pose_resid, target_pose_resids, scorefxn):
         if edge is not None:
             twobody += edge.dot(weights)
 
-    return onebody + twobody
+    return twobody
 
 
 def _repack_shell(pose, pose_resid, repack_shell_dist, scorefxn, minimize=False):
