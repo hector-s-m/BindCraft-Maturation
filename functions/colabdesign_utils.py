@@ -506,7 +506,7 @@ def binder_maturation_hallucination(design_name, starting_pdb, chain, target_hot
     # Inject fix_pos constraint — ColabDesign's _mutate() enforces this
     # Only set when non-empty; even an empty list triggers _fix_pos() which needs _wt_aatype
     if fixed_positions:
-        af_model.opt["fix_pos"] = list(fixed_positions)
+        af_model.opt["fix_pos"] = np.array(list(fixed_positions))
 
     # Shortened design stages (refinement, not de novo)
     soft_iters = advanced_settings.get("maturation_soft_iterations", 20)
