@@ -175,38 +175,14 @@ length = len(binder_seq)
 print(f"Binder chain: {binder_chain}, length: {length}, sequence: {binder_seq}")
 
 # ------------------------------------------------------------------
-# Run initial AF2 prediction to get PAE/pLDDT caches
+# Use input PDB directly — skip initial AF2 prediction.
+# Maturation round 1 will run its own AF2 prediction to get PAE/pLDDT.
 # ------------------------------------------------------------------
-print("\n=== Running initial AF2 prediction to obtain PAE/pLDDT ===")
-
-# The trajectory PDB is the input PDB (serves as structural reference)
 trajectory_pdb = input_pdb
+best_model_pdb = input_pdb
+best_model_number = 1  # dummy, not used when starting without prediction stats
 
-# Create prediction model (clear_mem first, same as main pipeline)
-clear_mem()
-complex_prediction_model = mk_afdesign_model(
-    protocol="binder",
-    num_recycles=advanced_settings["num_recycles_validation"],
-    data_dir=advanced_settings["af_params_dir"],
-    use_multimer=multimer_validation,
-    use_initial_guess=advanced_settings["predict_initial_guess"],
-    use_initial_atom_pos=advanced_settings["predict_bigbang"])
-
-if advanced_settings["predict_initial_guess"] or advanced_settings["predict_bigbang"]:
-    complex_prediction_model.prep_inputs(
-        pdb_filename=trajectory_pdb, chain="A", binder_chain="B",
-        binder_len=length, use_binder_template=True,
-        rm_target_seq=advanced_settings["rm_template_seq_predict"],
-        rm_target_sc=advanced_settings["rm_template_sc_predict"],
-        rm_template_ic=True)
-else:
-    complex_prediction_model.prep_inputs(
-        pdb_filename=target_settings["starting_pdb"],
-        chain=target_settings["chains"], binder_len=length,
-        rm_target_seq=advanced_settings["rm_template_seq_predict"],
-        rm_target_sc=advanced_settings["rm_template_sc_predict"])
-
-# Generate CSVs needed by predict_binder_complex
+# Generate CSVs needed by maturation internals
 trajectory_labels, design_labels, final_labels = generate_dataframe_labels()
 
 mpnn_csv = os.path.join(target_settings["design_path"], "mpnn_design_stats.csv")
@@ -216,38 +192,12 @@ failure_csv = os.path.join(target_settings["design_path"], "failure_csv.csv")
 create_dataframe(mpnn_csv, design_labels)
 generate_filter_pass_csv(failure_csv, args.filters)
 
-# Predict
-pred_stats, pass_af2, _ = predict_binder_complex(
-    complex_prediction_model, binder_seq, design_name,
-    target_settings["starting_pdb"], target_settings["chains"],
-    length, trajectory_pdb, prediction_models, advanced_settings,
-    filters, design_paths, failure_csv, use_pyrosetta=use_pyrosetta)
+# Empty stats — maturation will start with all residues unfixed
+pred_stats = {}
+complex_averages = {}
 
-if not pass_af2:
-    print("WARNING: Initial AF2 prediction failed quality filters, but continuing with maturation anyway.")
-
-# Pick best model by pLDDT
-model_plddt = {m: pred_stats[m].get("pLDDT", 0)
-               for m in pred_stats if not str(m).startswith("_")}
-best_model_number = max(model_plddt, key=model_plddt.get) if model_plddt else 0
-best_model_pdb_name = os.path.join(design_paths["MPNN"],
-                                    f"{design_name}_model{best_model_number}.pdb")
-
-# If prediction wrote a PDB, relax it; otherwise use input_pdb directly
-if os.path.exists(best_model_pdb_name):
-    best_model_pdb = best_model_pdb_name
-else:
-    print(f"  Predicted PDB not found at {best_model_pdb_name}, using input PDB")
-    best_model_pdb = input_pdb
-
-# Compute averages
-complex_averages = calculate_averages(pred_stats, handle_aa=False)
-
-print(f"\nInitial prediction results:")
-print(f"  Best model: {best_model_number+1}")
-print(f"  i_pTM:  {complex_averages.get('i_pTM', 'N/A')}")
-print(f"  ipSAE:  {complex_averages.get('ipSAE', 'N/A')}")
-print(f"  pLDDT:  {complex_averages.get('pLDDT', 'N/A')}")
+print(f"\nUsing input PDB directly: {input_pdb}")
+print(f"Maturation will start with all residues unfixed (no initial PAE/pLDDT).")
 
 # ------------------------------------------------------------------
 # Build candidate and context dicts for _run_maturation
@@ -274,6 +224,7 @@ import random
 seed = random.randint(0, 2**32 - 1)
 helicity_value = 0.0
 
+complex_prediction_model = None  # Created fresh each maturation round
 ctx = {
     "complex_prediction_model": complex_prediction_model,
     "design_models": design_models,
@@ -333,19 +284,22 @@ def _run_maturation(cand, ctx, advanced_settings, mat_label="maturation"):
     mat_target_len = best_pred_stats.get('_target_len')
     mat_binder_len = best_pred_stats.get('_binder_len')
 
-    if mat_pae is None or mat_plddt is None:
-        vprint(f"[Maturation] Skipped: no cached PAE/pLDDT data available")
-        return False, mpnn_data, best_model_pdb
+    # If no initial PAE/pLDDT, start with all residues unfixed.
+    # Round 1 will do its own AF2 prediction and populate these.
+    has_initial_stats = mat_pae is not None and mat_plddt is not None
 
     mat_current_pdb = best_model_pdb
     mat_current_seq = cand['sequence']
-    mat_best_metric = get_maturation_metric(mpnn_complex_averages, mat_metric_name)
+    mat_best_metric = get_maturation_metric(mpnn_complex_averages, mat_metric_name) if mpnn_complex_averages else 0.0
     mat_best_ipsae = mpnn_complex_averages.get('ipSAE', None)
     mat_pre_metric_iptm = mpnn_complex_averages.get('i_pTM', None)
     mat_pre_metric_ipsae = mat_best_ipsae
+    baseline_str = f"{mat_metric_name}={mat_best_metric:.4f}" if mpnn_complex_averages else "none (no initial prediction)"
     ipsae_str = f", ipSAE: {mat_pre_metric_ipsae:.4f}" if mat_pre_metric_ipsae is not None else ""
     print(f"\n--- Starting {mat_label} maturation for {mpnn_design_name} (max {mat_max_rounds} rounds) ---")
-    print(f"  Baseline: {mat_metric_name}={mat_best_metric:.4f}{ipsae_str}")
+    print(f"  Baseline: {baseline_str}{ipsae_str}")
+    if not has_initial_stats:
+        print(f"  No initial PAE/pLDDT — starting with all residues unfixed")
     mat_fixed_set = set()
     mat_rounds_completed = 0
     mat_converged = False
@@ -355,46 +309,54 @@ def _run_maturation(cand, ctx, advanced_settings, mat_label="maturation"):
     mat_best_averages = None
 
     for mat_round in range(1, mat_max_rounds + 1):
-        mat_per_residue_reu, mat_pose, mat_scorefxn = compute_per_residue_reu(
-            mat_current_pdb, binder_chain=binder_chain,
-            use_pyrosetta=use_pyrosetta, return_pose=True)
-        if mat_per_residue_reu is not None:
-            vprint(f"  [Maturation] Per-residue REU computed for {len(mat_per_residue_reu)} residues")
+        # Quality assessment requires PAE/pLDDT from a prior AF2 prediction.
+        # If unavailable (e.g. first round with no initial prediction), skip
+        # quality partitioning and redesign all residues.
+        if mat_pae is not None and mat_plddt is not None:
+            mat_per_residue_reu, mat_pose, mat_scorefxn = compute_per_residue_reu(
+                mat_current_pdb, binder_chain=binder_chain,
+                use_pyrosetta=use_pyrosetta, return_pose=True)
+            if mat_per_residue_reu is not None:
+                vprint(f"  [Maturation] Per-residue REU computed for {len(mat_per_residue_reu)} residues")
+            else:
+                vprint(f"  [Maturation] REU unavailable, using pLDDT/PAE/contacts only")
+
+            residue_quality = assess_interface_residue_quality(
+                mat_current_pdb, mat_pae, mat_plddt,
+                mat_target_len, mat_binder_len,
+                advanced_settings, binder_chain=binder_chain,
+                per_residue_reu=mat_per_residue_reu)
+
+            if not residue_quality:
+                print(f"  Maturation round {mat_round}: no interface residues found, stopping")
+                break
+
+            new_fixed, new_redesign, mat_converged = partition_interface_residues(
+                residue_quality, mat_fixed_set, advanced_settings)
+            mat_fixed_set = new_fixed
+
+            if mat_converged:
+                print(f"  Maturation converged at round {mat_round} — all interface residues are high quality")
+                break
+
+            if mat_fixed_set and use_pyrosetta:
+                scan_output = os.path.join(design_paths["MPNN/Maturation"],
+                                           f"{mpnn_design_name}_mat{mat_round}_scanned.pdb")
+                scan_seq, scan_mutations = scan_fixed_residues(
+                    mat_current_pdb, mat_fixed_set, binder_chain,
+                    advanced_settings, scan_output,
+                    preloaded_pose=mat_pose,
+                    preloaded_scorefxn=mat_scorefxn)
+                if scan_mutations:
+                    mat_current_pdb = scan_output
+                    mat_current_seq = scan_seq
+                    mat_all_scan_mutations.extend(scan_mutations)
+                    mut_str = ', '.join(f"{old}{idx+1}{new}" for idx, old, new, _, _ in scan_mutations)
+                    print(f"  [Scan] {len(scan_mutations)} mutations accepted: {mut_str}")
         else:
-            vprint(f"  [Maturation] REU unavailable, using pLDDT/PAE/contacts only")
-
-        residue_quality = assess_interface_residue_quality(
-            mat_current_pdb, mat_pae, mat_plddt,
-            mat_target_len, mat_binder_len,
-            advanced_settings, binder_chain=binder_chain,
-            per_residue_reu=mat_per_residue_reu)
-
-        if not residue_quality:
-            print(f"  Maturation round {mat_round}: no interface residues found, stopping")
-            break
-
-        new_fixed, new_redesign, mat_converged = partition_interface_residues(
-            residue_quality, mat_fixed_set, advanced_settings)
-        mat_fixed_set = new_fixed
-
-        if mat_converged:
-            print(f"  Maturation converged at round {mat_round} — all interface residues are high quality")
-            break
-
-        if mat_fixed_set and use_pyrosetta:
-            scan_output = os.path.join(design_paths["MPNN/Maturation"],
-                                       f"{mpnn_design_name}_mat{mat_round}_scanned.pdb")
-            scan_seq, scan_mutations = scan_fixed_residues(
-                mat_current_pdb, mat_fixed_set, binder_chain,
-                advanced_settings, scan_output,
-                preloaded_pose=mat_pose,
-                preloaded_scorefxn=mat_scorefxn)
-            if scan_mutations:
-                mat_current_pdb = scan_output
-                mat_current_seq = scan_seq
-                mat_all_scan_mutations.extend(scan_mutations)
-                mut_str = ', '.join(f"{old}{idx+1}{new}" for idx, old, new, _, _ in scan_mutations)
-                print(f"  [Scan] {len(scan_mutations)} mutations accepted: {mut_str}")
+            print(f"  Round {mat_round}: no PAE/pLDDT yet, redesigning all residues")
+            residue_quality = {}
+            new_redesign = set()
 
         mat_design_name = f"{mpnn_design_name}_mat{mat_round}"
         try:
@@ -486,11 +448,17 @@ def _run_maturation(cand, ctx, advanced_settings, mat_label="maturation"):
                              mat_best_metric, mat_new_metric,
                              ipsae=mat_new_ipsae)
 
-        metric_improved = mat_new_metric > mat_best_metric + mat_improvement_thresh
-        if mat_new_ipsae is not None and mat_best_ipsae is not None:
-            ipsae_improved = mat_new_ipsae > mat_best_ipsae + mat_ipsae_thresh
-        else:
+        # When there's no initial prediction (has_initial_stats=False), always accept
+        # round 1 as the new baseline — there's nothing meaningful to compare against.
+        if not has_initial_stats and mat_rounds_completed == 0:
+            metric_improved = True
             ipsae_improved = True
+        else:
+            metric_improved = mat_new_metric > mat_best_metric + mat_improvement_thresh
+            if mat_new_ipsae is not None and mat_best_ipsae is not None:
+                ipsae_improved = mat_new_ipsae > mat_best_ipsae + mat_ipsae_thresh
+            else:
+                ipsae_improved = True
 
         if metric_improved and ipsae_improved:
             mat_best_metric = mat_new_metric
@@ -503,6 +471,8 @@ def _run_maturation(cand, ctx, advanced_settings, mat_label="maturation"):
             if mat_best_model_stats.get('_pae_matrix') is not None:
                 mat_pae = mat_best_model_stats['_pae_matrix']
                 mat_plddt = mat_best_model_stats['_plddt_array']
+                mat_target_len = mat_best_model_stats.get('_target_len', mat_target_len)
+                mat_binder_len = mat_best_model_stats.get('_binder_len', mat_binder_len)
             mat_relaxed_best = os.path.join(design_paths["MPNN/Maturation"],
                                              f"{mat_mpnn_name}_model{mat_best_model_num}.pdb")
             if os.path.exists(mat_relaxed_best):
