@@ -1190,7 +1190,7 @@ while True:
                     mat_enabled = advanced_settings.get("enable_maturation", False)
                     mat_pre_filters = advanced_settings.get("maturation_pre_filters", False)
                     mat_revert_on_worse = advanced_settings.get("maturation_revert_on_worse", True)
-                    best_mat_candidate = None
+                    eligible_candidates = []
 
                     if mat_enabled and maturation_candidates:
                         # Sort by ipSAE descending
@@ -1214,25 +1214,23 @@ while True:
                                 best_n_hq = n_hq
                                 best_mat_candidate = candidate
 
-                        if best_mat_candidate:
-                            print(f"\n[Maturation Selection] {best_mat_candidate['design_name']} selected "
-                                  f"(ipSAE={best_mat_candidate['ipSAE']:.4f}, {best_n_hq} HQ residues)")
+                        # Build ranked list of eligible candidates (n_hq > 0), sorted by n_hq descending
+                        eligible_candidates = sorted(
+                            [c for c in ranked if c.get('n_hq', 0) > 0],
+                            key=lambda c: c['n_hq'], reverse=True)
+
+                        if eligible_candidates:
+                            print(f"\n[Maturation Selection] {len(eligible_candidates)} candidates with HQ residues "
+                                  f"(best: {eligible_candidates[0]['design_name']}, "
+                                  f"ipSAE={eligible_candidates[0]['ipSAE']:.4f}, {eligible_candidates[0]['n_hq']} HQ residues)")
                         else:
                             print(f"\n[Maturation Selection] No candidates with high-quality interface residues, skipping maturation")
 
                     ############################################
                     ### Phase 3: Process designs
                     ############################################
-                    if best_mat_candidate is not None:
-                        # Maturation candidate found — process only that candidate
-                        cand = best_mat_candidate
-                        cand_mpnn_data = cand['mpnn_data']
-                        cand_design_name = cand['design_name']
-                        cand_best_model_pdb = cand['best_model_pdb']
-                        cand_pre_mat_pdb = cand['best_model_pdb']  # Save for revert
-                        cand_pre_mat_data = list(cand_mpnn_data)  # Save copy for revert
-
-                        # Build context dict for maturation
+                    if mat_enabled and maturation_candidates and eligible_candidates:
+                        # Build context dict for maturation (shared across candidates)
                         ctx = {
                             'complex_prediction_model': complex_prediction_model,
                             'design_models': design_models,
@@ -1249,69 +1247,92 @@ while True:
                             'filters': filters,
                         }
 
-                        if mat_pre_filters:
-                            ############################################
-                            ### Pre-filter maturation: mature first, then filter check
-                            ############################################
-                            mat_ran, cand_mpnn_data, cand_best_model_pdb = _run_maturation(
-                                cand, ctx, advanced_settings, mat_label="pre-filter")
+                        # Try maturation on each eligible candidate until one succeeds
+                        maturation_succeeded = False
+                        for cand_idx, cand in enumerate(eligible_candidates):
+                            cand_mpnn_data = list(cand['mpnn_data'])
+                            cand_design_name = cand['design_name']
+                            cand_best_model_pdb = cand['best_model_pdb']
+                            cand_pre_mat_pdb = cand['best_model_pdb']  # Save for revert
+                            cand_pre_mat_data = list(cand_mpnn_data)  # Save copy for revert
 
-                            # Revert if maturation worsened metrics
-                            _, cand_mpnn_data, cand_best_model_pdb, mat_ran = _check_maturation_revert(
-                                mat_ran, mat_revert_on_worse, cand_mpnn_data,
-                                cand_pre_mat_data, cand_pre_mat_pdb, cand_best_model_pdb)
-
-                            # Filter check on matured (or reverted) design
-                            filter_conditions = check_filters(cand_mpnn_data, design_labels, filters)
-                            if filter_conditions is True:
-                                final_name = cand_design_name + ("_matured" if mat_ran else "")
-                                if mat_ran:
-                                    cand_mpnn_data[0] = final_name
-                                print(final_name + " passed all filters")
-                                accepted_mpnn += 1
-                                accepted_designs += 1
-
-                                if mat_ran:
-                                    update_last_csv_row(mpnn_csv, cand_mpnn_data)
-
-                                _accept_design(cand_best_model_pdb, cand_mpnn_data, design_name,
-                                               design_paths, final_csv, advanced_settings)
-                            else:
-                                _reject_design(cand_design_name, cand_best_model_pdb, cand_mpnn_data,
-                                               filter_conditions, failure_csv, design_paths,
-                                               filter_column_names_for_rejected_log,
-                                               rejected_mpnn_full_stats_csv, cand['sequence'])
-
-                        else:
-                            ############################################
-                            ### Post-filter maturation: filter check first, then mature
-                            ############################################
-                            filter_conditions = check_filters(cand_mpnn_data, design_labels, filters)
-                            if filter_conditions is True:
-                                print(cand_design_name + " passed all filters")
-                                accepted_mpnn += 1
-                                accepted_designs += 1
-
+                            if mat_pre_filters:
+                                ############################################
+                                ### Pre-filter maturation: mature first, then filter check
+                                ############################################
                                 mat_ran, cand_mpnn_data, cand_best_model_pdb = _run_maturation(
-                                    cand, ctx, advanced_settings, mat_label="post-filter")
+                                    cand, ctx, advanced_settings, mat_label="pre-filter")
+
+                                if not mat_ran and cand_idx < len(eligible_candidates) - 1:
+                                    print(f"  Maturation failed for {cand_design_name}, trying next candidate...")
+                                    continue
 
                                 # Revert if maturation worsened metrics
                                 _, cand_mpnn_data, cand_best_model_pdb, mat_ran = _check_maturation_revert(
                                     mat_ran, mat_revert_on_worse, cand_mpnn_data,
                                     cand_pre_mat_data, cand_pre_mat_pdb, cand_best_model_pdb)
 
-                                final_name = cand_design_name + ("_matured" if mat_ran else "")
-                                if mat_ran:
-                                    cand_mpnn_data[0] = final_name
-                                    update_last_csv_row(mpnn_csv, cand_mpnn_data)
+                                # Filter check on matured (or reverted) design
+                                filter_conditions = check_filters(cand_mpnn_data, design_labels, filters)
+                                if filter_conditions is True:
+                                    final_name = cand_design_name + ("_matured" if mat_ran else "")
+                                    if mat_ran:
+                                        cand_mpnn_data[0] = final_name
+                                    print(final_name + " passed all filters")
+                                    accepted_mpnn += 1
+                                    accepted_designs += 1
 
-                                _accept_design(cand_best_model_pdb, cand_mpnn_data, design_name,
-                                               design_paths, final_csv, advanced_settings)
+                                    if mat_ran:
+                                        update_last_csv_row(mpnn_csv, cand_mpnn_data)
+
+                                    _accept_design(cand_best_model_pdb, cand_mpnn_data, design_name,
+                                                   design_paths, final_csv, advanced_settings)
+                                    maturation_succeeded = True
+                                    break
+                                else:
+                                    _reject_design(cand_design_name, cand_best_model_pdb, cand_mpnn_data,
+                                                   filter_conditions, failure_csv, design_paths,
+                                                   filter_column_names_for_rejected_log,
+                                                   rejected_mpnn_full_stats_csv, cand['sequence'])
+
                             else:
-                                _reject_design(cand_design_name, cand_best_model_pdb, cand_mpnn_data,
-                                               filter_conditions, failure_csv, design_paths,
-                                               filter_column_names_for_rejected_log,
-                                               rejected_mpnn_full_stats_csv, cand['sequence'])
+                                ############################################
+                                ### Post-filter maturation: filter check first, then mature
+                                ############################################
+                                filter_conditions = check_filters(cand_mpnn_data, design_labels, filters)
+                                if filter_conditions is True:
+                                    print(cand_design_name + " passed all filters")
+                                    accepted_mpnn += 1
+                                    accepted_designs += 1
+
+                                    mat_ran, cand_mpnn_data, cand_best_model_pdb = _run_maturation(
+                                        cand, ctx, advanced_settings, mat_label="post-filter")
+
+                                    if not mat_ran and cand_idx < len(eligible_candidates) - 1:
+                                        print(f"  Maturation failed for {cand_design_name}, trying next candidate...")
+                                        accepted_mpnn -= 1
+                                        accepted_designs -= 1
+                                        continue
+
+                                    # Revert if maturation worsened metrics
+                                    _, cand_mpnn_data, cand_best_model_pdb, mat_ran = _check_maturation_revert(
+                                        mat_ran, mat_revert_on_worse, cand_mpnn_data,
+                                        cand_pre_mat_data, cand_pre_mat_pdb, cand_best_model_pdb)
+
+                                    final_name = cand_design_name + ("_matured" if mat_ran else "")
+                                    if mat_ran:
+                                        cand_mpnn_data[0] = final_name
+                                        update_last_csv_row(mpnn_csv, cand_mpnn_data)
+
+                                    _accept_design(cand_best_model_pdb, cand_mpnn_data, design_name,
+                                                   design_paths, final_csv, advanced_settings)
+                                    maturation_succeeded = True
+                                    break
+                                else:
+                                    _reject_design(cand_design_name, cand_best_model_pdb, cand_mpnn_data,
+                                                   filter_conditions, failure_csv, design_paths,
+                                                   filter_column_names_for_rejected_log,
+                                                   rejected_mpnn_full_stats_csv, cand['sequence'])
 
                     else:
                         # No maturation candidate — process ALL candidates through normal filter checking
