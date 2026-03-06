@@ -36,7 +36,7 @@
     "weights_termini_loss": 0.1,
     "enable_mpnn": true,
     "mpnn_fix_interface": true,
-    "num_seqs": 32,
+    "num_seqs": 15,
     "max_mpnn_sequences": 4,
     "sampling_temp": 0.15,
     "backbone_noise": 0.00,
