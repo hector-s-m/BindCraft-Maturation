@@ -598,11 +598,13 @@ def _run_maturation(cand, ctx, advanced_settings, mat_label="maturation"):
         mat_round_succeeded = False
         for mat_attempt in range(1, mat_max_retries + 1):
             attempt_suffix = f" (attempt {mat_attempt}/{mat_max_retries})" if mat_attempt > 1 else ""
+            # Vary seed per attempt so retries produce different hallucinations
+            attempt_seed = seed + (mat_attempt - 1) * 1000
             try:
                 mat_af_model, mat_traj_pdb = binder_maturation_hallucination(
                     mat_design_name, target_settings["starting_pdb"],
                     target_settings["chains"], target_settings.get("target_hotspot_residues", ""),
-                    length, mat_current_seq, list(mat_fixed_set), seed,
+                    length, mat_current_seq, list(mat_fixed_set), attempt_seed,
                     helicity_value, design_models, advanced_settings,
                     design_paths, failure_csv)
             except Exception as e:
