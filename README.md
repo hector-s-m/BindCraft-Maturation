@@ -1,4 +1,4 @@
-# BindCraft-Maturation
+# BindCraft-Maturation (WIP)
 
 A modified version of [BindCraft](https://github.com/martinpacesa/BindCraft) / [FreeBindCraft](https://github.com/cytokineking/FreeBindCraft) with [PPIFlow](https://github.com/Mingchenchen/PPIFlow)-inspired affinity maturation for recursive interface refinement.
 
